@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Spoonflower logo mosaic: 54" x 36" @ 150 DPI, mid-gray RGBA alpha paste, LANCZOS, soft Gaussian halo.
+Spoonflower logo mosaic: 54" x 36" @ 150 DPI, mid-gray RGBA alpha paste.
+
+Hard-capped with LANCZOS thumbnail (hero 220 / medium 150 / small 100 / micro 30–60).
+Vector bbox + exact alpha packing with 2px grout; process-pool composite.
 
 Copyright (c) 2026 Hillwork LLC
 SPDX-License-Identifier: MIT
@@ -8,16 +11,17 @@ SPDX-License-Identifier: MIT
 
 from __future__ import annotations
 
-import math
+import os
 import random
 import sys
-from collections import Counter, defaultdict, deque
-from dataclasses import dataclass, field
+import time
+from collections import Counter, deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageOps
-from rectpack.geometry import Rectangle as PackRect
-from rectpack.maxrects import MaxRectsBssf
+import numpy as np
+from PIL import Image, ImageFilter, ImageOps
 
 # ---------------------------------------------------------------------------
 # Configuration & Parameters (edit these to re-theme or re-size)
@@ -26,63 +30,48 @@ from rectpack.maxrects import MaxRectsBssf
 CANVAS_WIDTH = 8100   # 54 inches @ 150 DPI
 CANVAS_HEIGHT = 5400  # 36 inches @ 150 DPI
 BACKGROUND_COLOR = "#808080"  # Mid-gray target color
-TILE_CARD_COLOR = BACKGROUND_COLOR
 OUTPUT_FILE = "./spoonflower_logo_mosaic_54x36.png"
-GAPS_BETWEEN_TILES = 8  # Crisp spacing suitable for high-res print
-
-DRAW_TILE_CARDS = True
-CARD_CORNER_RADIUS = 0  # Cards blend into the canvas grout
-LOGO_INTERNAL_PADDING = 8  # Breathing room around the core mark
 
 PROJECT_DIR = Path(__file__).resolve().parent
 LOGOS_DIR = PROJECT_DIR / "logos"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".tif", ".tiff"}
 
-# Compact ~1.5"–3" printed logos on the 54x36 Spoonflower canvas.
 HERO_FRACTION = 0.10
 MEDIUM_FRACTION = 0.35
-HERO_TARGET_AREA = 140_000
-MEDIUM_TARGET_AREA = 55_000
-SMALL_TARGET_AREA = 20_000
-MICRO_TARGET_AREA = 6_000
+SMALL_FRACTION = 0.35
+MICRO_FRACTION = 0.20
 
-MIN_POOL_COVERAGE = 0.90  # Reject layouts below 90% occupied pack-rect density
-POOL_AREA_MULTIPLIER = 1.15  # Duplicate until logo pixel area is 1.15x the canvas (~50.3M px)
-TARGET_PACKED_COVERAGE = 0.92  # Elastic-expand if still under this after packing
-MAX_EMPTY_EDGE_MARGIN = 24  # Packed bbox must reach this close to every canvas edge
-MAX_HOLE_FRACTION = 0.015  # Reject layouts whose largest leftover rect is a giant hole
-HOLE_FILL_MIN_SIDE = 48  # Plug leftover voids at least 48x48
-HOLE_FILL_MAX_ITERS = 280
-MICRO_LOGO_MIN = 40
-MICRO_LOGO_MAX = 120
-MICRO_PADDING = 2
-ELASTIC_SCALE_MIN = 1.03
-ELASTIC_SCALE_MAX = 1.06
-MAX_TILES = 4000
-MIN_DUPLICATE_DISTANCE = 720  # Identical logos stay apart (~4.8" at 150 DPI)
-DUPLICATE_SIZE_MATCH = 0.8  # Swap partners must match pack width/height within this ratio
+# Hard pixel caps: max(width, height) via Image.thumbnail(..., LANCZOS).
+ABSOLUTE_MAX_PX = 220  # Hero cap (~1.47" @ 150 DPI)
+MIN_LOGO_PX = 25       # Micro floor
+TIER_MAX = {
+    "hero": 220,
+    "medium": 150,
+    "small": 100,
+    "micro": 75,
+}
+TIER_MIN = {
+    "micro": 25,
+}
 
-MID_X = CANVAS_WIDTH // 2
-MID_Y = CANVAS_HEIGHT // 2
-MIN_SEEDED_HEROES = 5
-MAX_SEEDED_HEROES = 8
-MINIMUM_HERO_DISTANCE = 1100  # Poisson-style separation between seeded hero centers
-TARGET_COM_X_MIN = 3240
-TARGET_COM_X_MAX = 4860
-TARGET_COM_Y_MIN = 2160
-TARGET_COM_Y_MAX = 3240
-LIGHT_BG_LUMA = 185  # Off-white / light gray field
-MEDIUM_BG_LUMA = 110  # Medium gray (e.g. #808080) sits between this and LIGHT_BG_LUMA
+STROKE_PX = 2
+STROKE_COLOR = (0, 0, 0)
+LIGHT_MARK_LUMA = 140  # Light/white marks get a 2px dark outer stroke
 
-MAX_SHUFFLE_ATTEMPTS = 40
-AREA_SHRINK_FACTOR = 0.88
-MAX_SHRINK_ROUNDS = 40
-MAX_EXPAND_ROUNDS = 12
-EXPAND_SEED = 2026
+MIN_DUPLICATE_DISTANCE = 500
+BOX_PAD = 1              # 1px grout for dense sticker-bomb packing
+MICRO_PAD = 1
+TARGET_OCCUPANCY = 0.90
+LAYOUT_SEED = 2026
+PRIMARY_QUEUE = 4500
+PLACE_TRIES = 250        # random samples per item (150–300)
+PLACE_TRIES_MAX = 300
+ALPHA_INK_MIN = 32       # exact-mask collision ignores near-transparent fringe
+
+CPU_COUNT = os.cpu_count() or 8
+RENDER_WORKERS = max(1, CPU_COUNT)
 
 OUTPUT_DPI = 150
-MAX_LOGO_WIDTH_INCHES = 3.0
-MAX_LOGO_WIDTH = int(round(MAX_LOGO_WIDTH_INCHES * OUTPUT_DPI))  # 450 px @ 150 DPI
 
 WHITE_LUMA_MIN = 210
 BLACK_LUMA_MAX = 48
@@ -94,75 +83,23 @@ FRINGE_DESPILL = 52
 BORDER_MATCH_MIN = 0.72
 BORDER_STD_MAX = 8.0
 
-HALO_BLUR = 8.0  # GaussianBlur on alpha at print scale (no MaxFilter / dilation)
-HALO_STRENGTH = 0.5  # Soft shadow/glow opacity
-SHADOW_COLOR = "#2A2A2A"
-GLOW_COLOR = "#F2F2F2"
-MICRO_DUP_DISTANCE = 140
-MICRO_HOLE_MAX_SIDE = 120  # Holes this small (or smaller) get micro-fillers
-MICRO_AREA_MIN = 4_000
-MICRO_AREA_MAX = 8_000
-
 # Filename keys match flexibly (exact name, stem, or normalized aliases like snow_bunny).
 LOGO_OVERRIDES: dict[str, dict] = {
     "snow_bunny.png": {"invert": False},
     "billie_eilish.png": {},
     "lelas_bistro.png": {"invert": False},
     "lela_s": {},
+    "takara_sushi": {"invert": True},
+    "kann": {"invert": True},
+    "function_logo": {"invert": True},
+    "karaoke_from_hell": {"invert": True},
+    "hey_luigi": {"invert": True},
+    "janken": {"invert": True},
+    "ringside": {"invert": True},
+    "ovation": {"invert": True},
+    "can_font": {"invert": True},
+    "the_star": {"invert": True},
 }
-
-
-@dataclass
-class LogoSource:
-    path: Path
-    display_name: str
-    image: Image.Image
-    orig_w: int
-    orig_h: int
-    base_id: str
-    copy_id: int | None = None
-    normalize_note: str = ""
-
-
-@dataclass
-class Tile:
-    index: int
-    source: LogoSource
-    tier: str
-    target_area: float
-    scaled_w: int
-    scaled_h: int
-    card_w: int
-    card_h: int
-    pack_w: int
-    pack_h: int
-    is_anchor: bool = False
-
-
-@dataclass
-class PlacedTile:
-    tile: Tile
-    pack_x: int
-    pack_y: int
-
-
-@dataclass
-class PackResult:
-    placed: list[PlacedTile]
-    coverage: float
-    max_x: int
-    max_y: int
-    largest_hole_fraction: float
-    seed: int
-    extra_copies: int = 0
-    micro_fills: int = 0
-    elastic_scale: float = 1.0
-    swap_count: int = 0
-    swap_log: list[str] = field(default_factory=list)
-    duplicate_violations: int = 0
-    x_center_of_mass: float = float(MID_X)
-    y_center_of_mass: float = float(MID_Y)
-    min_hero_distance: float = 0.0
 
 
 def hex_to_rgb(color: str) -> tuple[int, int, int]:
@@ -172,39 +109,6 @@ def hex_to_rgb(color: str) -> tuple[int, int, int]:
 
 def luma(rgb: tuple[int, ...]) -> float:
     return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
-
-
-def srgb_to_linear(channel: float) -> float:
-    c = channel / 255.0
-    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
-
-
-def relative_luminance(rgb: tuple[int, ...]) -> float:
-    return (
-        0.2126 * srgb_to_linear(rgb[0])
-        + 0.7152 * srgb_to_linear(rgb[1])
-        + 0.0722 * srgb_to_linear(rgb[2])
-    )
-
-
-def contrast_ratio(a: tuple[int, ...], b: tuple[int, ...]) -> float:
-    lighter = max(relative_luminance(a), relative_luminance(b))
-    darker = min(relative_luminance(a), relative_luminance(b))
-    return (lighter + 0.05) / (darker + 0.05)
-
-
-def field_kind(bg_rgb: tuple[int, int, int] | None = None) -> str:
-    rgb = bg_rgb if bg_rgb is not None else hex_to_rgb(BACKGROUND_COLOR)
-    y = luma(rgb)
-    if y >= LIGHT_BG_LUMA:
-        return "light"
-    if y >= MEDIUM_BG_LUMA:
-        return "medium"
-    return "dark"
-
-
-def background_is_light(bg_rgb: tuple[int, int, int] | None = None) -> bool:
-    return field_kind(bg_rgb) == "light"
 
 
 def is_compression_box_color(rgb: tuple[int, ...]) -> bool:
@@ -278,27 +182,6 @@ def border_stats(img: Image.Image, bg_rgb: tuple[int, int, int]) -> tuple[float,
     return match / len(samples), variance ** 0.5
 
 
-def sample_corner(px, width: int, height: int, x: int, y: int) -> tuple[int, int, int] | None:
-    x0 = min(max(x, 0), width - 1)
-    y0 = min(max(y, 0), height - 1)
-    totals = [0, 0, 0]
-    count = 0
-    for dy in range(-2, 3):
-        for dx in range(-2, 3):
-            sx = min(max(x0 + dx, 0), width - 1)
-            sy = min(max(y0 + dy, 0), height - 1)
-            pixel = px[sx, sy]
-            if pixel[3] < 16:
-                continue
-            totals[0] += pixel[0]
-            totals[1] += pixel[1]
-            totals[2] += pixel[2]
-            count += 1
-    if count == 0:
-        return None
-    return totals[0] // count, totals[1] // count, totals[2] // count
-
-
 def has_useful_alpha(img: Image.Image) -> bool:
     if img.mode in ("RGBA", "LA"):
         alpha = img.getchannel("A")
@@ -321,12 +204,6 @@ def crop_to_alpha(img: Image.Image, pad: int = 1) -> Image.Image:
     right = min(img.width, right + pad)
     bottom = min(img.height, bottom + pad)
     return img.crop((left, top, right, bottom))
-
-
-def composite_on_gray(img: Image.Image, gray_rgb: tuple[int, int, int]) -> Image.Image:
-    card = Image.new("RGBA", img.size, gray_rgb + (255,))
-    card.alpha_composite(img)
-    return card
 
 
 def normalize_override_key(name: str) -> str:
@@ -363,25 +240,16 @@ def lookup_logo_override(path: Path) -> dict:
 
 
 def opaque_luma_stats(gray: Image.Image, alpha: Image.Image) -> tuple[float, float, float]:
-    gpx = gray.load()
-    apx = alpha.load()
-    width, height = gray.size
-    total = 0.0
-    total_sq = 0.0
-    count = 0
-    for y in range(height):
-        for x in range(width):
-            if apx[x, y] < 16:
-                continue
-            value = gpx[x, y]
-            total += value
-            total_sq += value * value
-            count += 1
+    g = np.asarray(gray, dtype=np.float64)
+    a = np.asarray(alpha, dtype=np.uint8)
+    mask = a >= 16
+    count = int(mask.sum())
     if count == 0:
         return 128.0, 0.0, 0.0
-    mean = total / count
-    variance = max(0.0, total_sq / count - mean * mean)
-    fill = count / float(width * height)
+    vals = g[mask]
+    mean = float(vals.mean())
+    variance = float(vals.var())
+    fill = count / float(g.size)
     return mean, variance ** 0.5, fill
 
 
@@ -400,23 +268,71 @@ def to_soft_grayscale(img: Image.Image, override: dict | None = None) -> tuple[I
     return out, "rgba grayscale"
 
 
-def apply_soft_halo(logo: Image.Image) -> Image.Image:
-    """Soft drop shadow or glow from a blurred alpha — no MaxFilter, erosion, or binary mask."""
-    rgba = logo.convert("RGBA")
+def lanczos_thumbnail(img: Image.Image, max_px: int) -> Image.Image:
+    work = img.convert("RGBA").copy()
+    max_px = max(1, int(max_px))
+    work.thumbnail((max_px, max_px), Image.Resampling.LANCZOS)
+    return work
+
+
+def enforce_pixel_cap(img: Image.Image, max_px: int) -> Image.Image:
+    """Belt-and-suspenders cap used at load. LANCZOS only."""
+    capped = lanczos_thumbnail(img, min(max_px, ABSOLUTE_MAX_PX))
+    if max(capped.size) > ABSOLUTE_MAX_PX:
+        capped.thumbnail((ABSOLUTE_MAX_PX, ABSOLUTE_MAX_PX), Image.Resampling.LANCZOS)
+    if max(capped.size) > max_px:
+        capped.thumbnail((max_px, max_px), Image.Resampling.LANCZOS)
+    return capped
+
+
+def _contrast_lut() -> list[int]:
+    """Steep S-curve: darks toward #000, lights toward #FFF, edge ramps stay anti-aliased."""
+    lut: list[int] = []
+    for i in range(256):
+        t = i / 255.0
+        t = (t - 0.5) * 1.9 + 0.5
+        t = min(1.0, max(0.0, t))
+        # Soft crush of the extremes without a hard 1-bit snap
+        if t < 0.06:
+            t = 0.0
+        elif t > 0.94:
+            t = 1.0
+        lut.append(int(round(t * 255)))
+    return lut
+
+
+CONTRAST_LUT = _contrast_lut()
+
+
+def boost_contrast_keep_aa(img: Image.Image) -> Image.Image:
+    """High-contrast grayscale with original anti-aliased alpha. No 1-bit interior snap."""
+    rgba = img.convert("RGBA")
     alpha = rgba.getchannel("A")
-    mean, _std, _fill = opaque_luma_stats(rgba.convert("L"), alpha)
-    tint = hex_to_rgb(SHADOW_COLOR if mean >= 140 else GLOW_COLOR)
-    glow = alpha.filter(ImageFilter.GaussianBlur(HALO_BLUR))
-    glow = glow.point(lambda a: min(255, int(a * HALO_STRENGTH)))
-    pad = max(8, int(math.ceil(HALO_BLUR * 3)))
-    width, height = rgba.size
-    halo = Image.new("RGBA", (width + pad * 2, height + pad * 2), (0, 0, 0, 0))
-    tinted = Image.new("RGBA", halo.size, tint + (255,))
-    glow_pad = Image.new("L", halo.size, 0)
-    glow_pad.paste(glow, (pad, pad))
-    tinted.putalpha(glow_pad)
-    halo.alpha_composite(tinted)
-    return halo
+    gray = ImageOps.grayscale(rgba.convert("RGB"))
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    gray = gray.point(CONTRAST_LUT)
+    rgb = Image.merge("RGB", (gray, gray, gray))
+    out = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+    out.paste(rgb, mask=alpha)
+    out.putalpha(alpha)
+    return out
+
+
+def apply_dark_stroke(img: Image.Image, px: int = STROKE_PX) -> Image.Image:
+    """2px dark outer stroke so light/white marks read on #808080."""
+    rgba = img.convert("RGBA")
+    pad = max(0, int(px))
+    if pad <= 0:
+        return rgba
+    canvas = Image.new("RGBA", (rgba.width + pad * 2, rgba.height + pad * 2), (0, 0, 0, 0))
+    canvas.paste(rgba, (pad, pad), rgba)
+    dilated = canvas.getchannel("A").filter(ImageFilter.MaxFilter(pad * 2 + 1))
+    stroke = Image.new("RGBA", canvas.size, STROKE_COLOR + (255,))
+    stroke.putalpha(dilated)
+    out = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    out.paste(stroke, (0, 0), stroke)
+    out.paste(canvas, (0, 0), canvas)
+    return out
 
 
 def flood_background_mask(
@@ -500,13 +416,31 @@ def image_corners(img: Image.Image) -> list[tuple[int, int, int]]:
     px = img.load()
     inset_x = min(2, max(0, width - 1))
     inset_y = min(2, max(0, height - 1))
-    sampled = [
-        sample_corner(px, width, height, inset_x, inset_y),
-        sample_corner(px, width, height, width - 1 - inset_x, inset_y),
-        sample_corner(px, width, height, inset_x, height - 1 - inset_y),
-        sample_corner(px, width, height, width - 1 - inset_x, height - 1 - inset_y),
-    ]
-    return [corner for corner in sampled if corner is not None]
+    corners: list[tuple[int, int, int]] = []
+    for x, y in (
+        (inset_x, inset_y),
+        (width - 1 - inset_x, inset_y),
+        (inset_x, height - 1 - inset_y),
+        (width - 1 - inset_x, height - 1 - inset_y),
+    ):
+        x0 = min(max(x, 0), width - 1)
+        y0 = min(max(y, 0), height - 1)
+        totals = [0, 0, 0]
+        count = 0
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                sx = min(max(x0 + dx, 0), width - 1)
+                sy = min(max(y0 + dy, 0), height - 1)
+                pixel = px[sx, sy]
+                if pixel[3] < 16:
+                    continue
+                totals[0] += pixel[0]
+                totals[1] += pixel[1]
+                totals[2] += pixel[2]
+                count += 1
+        if count:
+            corners.append((totals[0] // count, totals[1] // count, totals[2] // count))
+    return corners
 
 
 def classify_background(img: Image.Image) -> tuple[str, tuple[int, int, int]] | None:
@@ -639,1068 +573,545 @@ def normalize_logo(
     return work, " + ".join(notes)
 
 
-def load_logo_sources(paths: list[Path]) -> list[LogoSource]:
+def _preprocess_job(path_str: str) -> tuple[str, str, int, int, bytes] | None:
+    """Normalize, LANCZOS-cap, AA contrast, and 2px stroke once per source."""
+    path = Path(path_str)
     gray_rgb = hex_to_rgb(BACKGROUND_COLOR)
-    sources: list[LogoSource] = []
-    print("\nNormalizing logo backgrounds...")
-    for path in paths:
-        with Image.open(path) as raw:
-            normalized, note = normalize_logo(raw, gray_rgb, path)
-        if normalized.width < 1 or normalized.height < 1:
+    with Image.open(path) as raw:
+        normalized, note = normalize_logo(raw, gray_rgb, path)
+    if normalized.width < 1 or normalized.height < 1:
+        return None
+    before = normalized.size
+    master = enforce_pixel_cap(normalized, ABSOLUTE_MAX_PX)
+    master = boost_contrast_keep_aa(master)
+    mean, _std, _fill = opaque_luma_stats(master.convert("L"), master.getchannel("A"))
+    if mean >= LIGHT_MARK_LUMA:
+        master = apply_dark_stroke(master, STROKE_PX)
+        if max(master.size) > ABSOLUTE_MAX_PX:
+            master.thumbnail((ABSOLUTE_MAX_PX, ABSOLUTE_MAX_PX), Image.Resampling.LANCZOS)
+    note = (
+        f"{note}; thumbnail≤{ABSOLUTE_MAX_PX}px "
+        f"{before[0]}x{before[1]}→{master.width}x{master.height}"
+    )
+    buf = BytesIO()
+    master.save(buf, format="PNG")
+    return path_str, note, master.width, master.height, buf.getvalue()
+
+
+def _map_parallel(fn, jobs):
+    """Multi-core map. Threads for image work (ProcessPool spawn can stall on import)."""
+    if not jobs:
+        return []
+    try:
+        with ProcessPoolExecutor(max_workers=RENDER_WORKERS) as executor:
+            return list(executor.map(fn, jobs, chunksize=1))
+    except Exception as exc:
+        print(f"  ProcessPool unavailable ({exc}); falling back to threads")
+        with ThreadPoolExecutor(max_workers=RENDER_WORKERS) as executor:
+            return list(executor.map(fn, jobs, chunksize=1))
+
+
+def _add_transparent_hpad(img: Image.Image, side: str, px: int) -> Image.Image:
+    """Widen the RGBA buffer with empty pixels on one side. No rescaling."""
+    pad = max(0, int(px))
+    if pad <= 0:
+        return img
+    work = img.convert("RGBA")
+    out = Image.new("RGBA", (work.width + pad, work.height), (0, 0, 0, 0))
+    out.paste(work, (0, 0) if side == "right" else (pad, 0), work)
+    return out
+
+
+def preprocess_assets(
+    paths: list[Path],
+) -> tuple[dict[str, Image.Image], dict[tuple[str, int], Image.Image]]:
+    print("\nPhase 1: preprocess sources (LANCZOS + contrast + stroke)...")
+    jobs = [str(path) for path in paths]
+    with ThreadPoolExecutor(max_workers=RENDER_WORKERS) as executor:
+        results = list(executor.map(_preprocess_job, jobs, chunksize=1))
+    logos_dict: dict[str, Image.Image] = {}
+    for path, result in zip(paths, results):
+        if result is None:
             print(f"  Skipping empty image: {path.name}")
             continue
-        sources.append(
-            LogoSource(
-                path=path,
-                display_name=path.name,
-                image=normalized,
-                orig_w=normalized.width,
-                orig_h=normalized.height,
-                base_id=path.stem,
-                normalize_note=note,
+        _path_str, note, width, height, blob = result
+        if max(width, height) > ABSOLUTE_MAX_PX:
+            raise RuntimeError(
+                f"{path.name} loaded at {width}x{height}, over the {ABSOLUTE_MAX_PX}px cap"
             )
-        )
-        print(
-            f"  {path.name}: {note}; "
-            f"{normalized.width}x{normalized.height} (aspect {normalized.width / normalized.height:.2f})"
-        )
-    return sources
+        logos_dict[path.stem] = Image.open(BytesIO(blob)).convert("RGBA")
+        print(f"  {path.name}: {note}")
+    print(f"  Cached {len(logos_dict)} source bitmaps")
 
-
-def make_copy(source: LogoSource, copy_id: int) -> LogoSource:
-    stem = source.path.stem
-    suffix = source.path.suffix or ".png"
-    return LogoSource(
-        path=source.path,
-        display_name=f"{stem}_copy_{copy_id}{suffix}",
-        image=source.image,
-        orig_w=source.orig_w,
-        orig_h=source.orig_h,
-        base_id=source.base_id,
-        copy_id=copy_id,
-        normalize_note=source.normalize_note,
+    rng = random.Random(LAYOUT_SEED)
+    tier_buffers: dict[tuple[str, int], Image.Image] = {}
+    n_pad = 0
+    for lid, master in logos_dict.items():
+        for cap in (TIER_MAX["medium"], TIER_MAX["small"]):
+            img = _scale_logo(master, cap)
+            if rng.random() < 0.40:
+                img = _add_transparent_hpad(
+                    img, rng.choice(("left", "right")), rng.randint(10, 30)
+                )
+                n_pad += 1
+            tier_buffers[(lid, cap)] = img
+    print(
+        f"  Asymmetric pre-pad: {n_pad} of {len(logos_dict) * 2} medium/small buffers "
+        f"(10–30px left or right)"
     )
+    return logos_dict, tier_buffers
 
 
-def clamp_logo_dimensions(scaled_w: int, scaled_h: int) -> tuple[int, int]:
-    """Cap logo width at 3 inches, preserving aspect ratio."""
-    if scaled_w > MAX_LOGO_WIDTH:
-        scale = MAX_LOGO_WIDTH / float(scaled_w)
-        scaled_w = MAX_LOGO_WIDTH
-        scaled_h = max(1, int(round(scaled_h * scale)))
-    return scaled_w, scaled_h
 
-
-def dimensions_for_area(orig_w: int, orig_h: int, target_area: float) -> tuple[int, int]:
-    aspect = orig_w / orig_h
-    scaled_w = max(1, int(round(math.sqrt(target_area * aspect))))
-    scaled_h = max(1, int(round(math.sqrt(target_area / aspect))))
-    return clamp_logo_dimensions(scaled_w, scaled_h)
-
-
-def build_tile(
-    index: int,
-    source: LogoSource,
-    tier: str,
-    target_area: float,
-    max_pack_w: int = CANVAS_WIDTH,
-    max_pack_h: int = CANVAS_HEIGHT,
-) -> Tile:
-    scaled_w, scaled_h = dimensions_for_area(source.orig_w, source.orig_h, target_area)
-    card_w = scaled_w + (LOGO_INTERNAL_PADDING * 2)
-    card_h = scaled_h + (LOGO_INTERNAL_PADDING * 2)
-    pack_w = card_w + GAPS_BETWEEN_TILES
-    pack_h = card_h + GAPS_BETWEEN_TILES
-
-    if pack_w > max_pack_w or pack_h > max_pack_h:
-        fit = min(max_pack_w / pack_w, max_pack_h / pack_h)
-        scaled_w = max(1, int(scaled_w * fit))
-        scaled_h = max(1, int(scaled_h * fit))
-        card_w = scaled_w + (LOGO_INTERNAL_PADDING * 2)
-        card_h = scaled_h + (LOGO_INTERNAL_PADDING * 2)
-        pack_w = card_w + GAPS_BETWEEN_TILES
-        pack_h = card_h + GAPS_BETWEEN_TILES
-
-    return Tile(
-        index=index,
-        source=source,
-        tier=tier,
-        target_area=target_area,
-        scaled_w=scaled_w,
-        scaled_h=scaled_h,
-        card_w=card_w,
-        card_h=card_h,
-        pack_w=pack_w,
-        pack_h=pack_h,
-    )
-
-
-def tile_padding(tile: Tile) -> int:
-    return MICRO_PADDING if tile.tier == "micro" else LOGO_INTERNAL_PADDING
-
-
-def build_snug_tile(
-    index: int,
-    source: LogoSource,
-    hole_w: int,
-    hole_h: int,
-    tier: str = "small",
-) -> Tile:
-    """Scale a logo to fill a leftover void as tightly as aspect ratio allows."""
-    pad = MICRO_PADDING if tier == "micro" else LOGO_INTERNAL_PADDING
-    max_card_w = max(1, hole_w - GAPS_BETWEEN_TILES)
-    max_card_h = max(1, hole_h - GAPS_BETWEEN_TILES)
-    max_logo_w = max(1, max_card_w - pad * 2)
-    max_logo_h = max(1, max_card_h - pad * 2)
-    fit = min(max_logo_w / source.orig_w, max_logo_h / source.orig_h)
-    scaled_w = max(1, int(source.orig_w * fit))
-    scaled_h = max(1, int(source.orig_h * fit))
-    if tier == "micro":
-        area = max(1, scaled_w * scaled_h)
-        target = min(MICRO_AREA_MAX, max(MICRO_AREA_MIN, MICRO_TARGET_AREA))
-        if area > MICRO_AREA_MAX or (area > target and min(hole_w, hole_h) <= MICRO_HOLE_MAX_SIDE):
-            shrink = math.sqrt(target / float(area))
-            scaled_w = max(MICRO_LOGO_MIN, int(scaled_w * shrink))
-            scaled_h = max(MICRO_LOGO_MIN, int(scaled_h * shrink))
-        short = min(scaled_w, scaled_h)
-        if short > MICRO_LOGO_MAX and min(hole_w, hole_h) <= MICRO_HOLE_MAX_SIDE:
-            shrink = MICRO_LOGO_MAX / float(short)
-            scaled_w = max(MICRO_LOGO_MIN, int(scaled_w * shrink))
-            scaled_h = max(MICRO_LOGO_MIN, int(scaled_h * shrink))
-        short = min(scaled_w, scaled_h)
-        if short < MICRO_LOGO_MIN:
-            grow = MICRO_LOGO_MIN / float(max(short, 1))
-            scaled_w = max(1, int(scaled_w * grow))
-            scaled_h = max(1, int(scaled_h * grow))
-    scaled_w, scaled_h = clamp_logo_dimensions(scaled_w, scaled_h)
-    card_w = scaled_w + pad * 2
-    card_h = scaled_h + pad * 2
-    pack_w = card_w + GAPS_BETWEEN_TILES
-    pack_h = card_h + GAPS_BETWEEN_TILES
-    if pack_w > hole_w or pack_h > hole_h:
-        fit = min(hole_w / pack_w, hole_h / pack_h)
-        scaled_w = max(1, int(scaled_w * fit))
-        scaled_h = max(1, int(scaled_h * fit))
-        card_w = scaled_w + pad * 2
-        card_h = scaled_h + pad * 2
-        pack_w = min(hole_w, card_w + GAPS_BETWEEN_TILES)
-        pack_h = min(hole_h, card_h + GAPS_BETWEEN_TILES)
-    return Tile(
-        index=index,
-        source=source,
-        tier=tier,
-        target_area=float(scaled_w * scaled_h),
-        scaled_w=scaled_w,
-        scaled_h=scaled_h,
-        card_w=card_w,
-        card_h=card_h,
-        pack_w=pack_w,
-        pack_h=pack_h,
-    )
-
-
-def tier_counts(n: int) -> tuple[int, int, int]:
-    n_hero = min(n, max(0, round(n * HERO_FRACTION)))
-    remaining = n - n_hero
-    n_medium = min(remaining, max(0, round(n * MEDIUM_FRACTION)))
-    n_small = n - n_hero - n_medium
-    return n_hero, n_medium, n_small
-
-
-def assign_tiers(
-    sources: list[LogoSource],
-    seed: int,
-    hero_area: float,
-    medium_area: float,
-    small_area: float,
-) -> list[Tile]:
-    n_hero, n_medium, _n_small = tier_counts(len(sources))
-    order = list(enumerate(sources))
-    rng = random.Random(seed)
-    rng.shuffle(order)
-
-    tiles: list[Tile] = []
-    for rank, (index, source) in enumerate(order):
-        if rank < n_hero:
-            tier, area = "hero", hero_area
-        elif rank < n_hero + n_medium:
-            tier, area = "medium", medium_area
-        else:
-            tier, area = "small", small_area
-        tiles.append(build_tile(index, source, tier, area))
-    return tiles
-
-
-def estimated_pack_coverage(
-    sources: list[LogoSource],
-    hero_area: float,
-    medium_area: float,
-    small_area: float,
-) -> float:
-    tiles = assign_tiers(sources, seed=1, hero_area=hero_area, medium_area=medium_area, small_area=small_area)
-    used = sum(tile.pack_w * tile.pack_h for tile in tiles)
-    return used / float(CANVAS_WIDTH * CANVAS_HEIGHT)
-
-
-def pool_logo_pixel_area(
-    sources: list[LogoSource],
-    hero_area: float,
-    medium_area: float,
-    small_area: float,
-) -> int:
-    """Sum of scaled logo pixel areas (not including grout/padding) for the current pool."""
-    tiles = assign_tiers(sources, seed=1, hero_area=hero_area, medium_area=medium_area, small_area=small_area)
-    return sum(tile.scaled_w * tile.scaled_h for tile in tiles)
-
-
-def largest_empty_fraction(placed: list[PlacedTile], grid: int = 48) -> float:
-    occupied = [[False] * grid for _ in range(grid)]
-    cell_w = CANVAS_WIDTH / grid
-    cell_h = CANVAS_HEIGHT / grid
-    for item in placed:
-        x0 = min(grid - 1, max(0, int(item.pack_x / cell_w)))
-        y0 = min(grid - 1, max(0, int(item.pack_y / cell_h)))
-        x1 = min(grid - 1, max(0, int((item.pack_x + item.tile.pack_w - 1) / cell_w)))
-        y1 = min(grid - 1, max(0, int((item.pack_y + item.tile.pack_h - 1) / cell_h)))
-        for y in range(y0, y1 + 1):
-            row = occupied[y]
-            for x in range(x0, x1 + 1):
-                row[x] = True
-
-    largest = 0
-    height = [0] * grid
-    for y in range(grid):
-        for x in range(grid):
-            height[x] = 0 if occupied[y][x] else height[x] + 1
-        stack: list[int] = []
-        for x in range(grid + 1):
-            current = height[x] if x < grid else 0
-            while stack and height[stack[-1]] > current:
-                h = height[stack.pop()]
-                left = stack[-1] + 1 if stack else 0
-                largest = max(largest, h * (x - left))
-            stack.append(x)
-    return largest / float(grid * grid)
-
-
-def summarize_pack(placed: list[PlacedTile]) -> tuple[float, int, int, float]:
-    used = sum(item.tile.pack_w * item.tile.pack_h for item in placed)
-    coverage = used / float(CANVAS_WIDTH * CANVAS_HEIGHT)
-    max_x = max(item.pack_x + item.tile.pack_w for item in placed)
-    max_y = max(item.pack_y + item.tile.pack_h for item in placed)
-    return coverage, max_x, max_y, largest_empty_fraction(placed)
-
-
-def interleave_by_base_id(tiles: list[Tile], rng: random.Random) -> list[Tile]:
-    """Spread copies of the same logo through the packer queue so they are not adjacent."""
-    groups: dict[str, deque[Tile]] = defaultdict(deque)
-    order: list[str] = []
-    for tile in tiles:
-        base_id = tile.source.base_id
-        if base_id not in groups:
-            order.append(base_id)
-        groups[base_id].append(tile)
-    rng.shuffle(order)
-    for base_id in order:
-        items = list(groups[base_id])
-        rng.shuffle(items)
-        groups[base_id] = deque(items)
-
-    interleaved: list[Tile] = []
-    last_id: str | None = None
-    while any(groups.values()):
-        candidates = [base_id for base_id, queue in groups.items() if queue and base_id != last_id]
-        if not candidates:
-            candidates = [base_id for base_id, queue in groups.items() if queue]
-        pick = max(candidates, key=lambda base_id: len(groups[base_id]))
-        interleaved.append(groups[pick].popleft())
-        last_id = pick
-    return interleaved
-
-
-def rects_adjacent(
-    x1: int, y1: int, w1: int, h1: int,
-    x2: int, y2: int, w2: int, h2: int,
+def _too_close_id(
+    x: float,
+    y: float,
+    previous: list[tuple[float, float]],
+    min_dist: float = MIN_DUPLICATE_DISTANCE,
 ) -> bool:
-    ax2, ay2 = x1 + w1, y1 + h1
-    bx2, by2 = x2 + w2, y2 + h2
-    h_gap = max(0, max(x1, x2) - min(ax2, bx2))
-    v_gap = max(0, max(y1, y2) - min(ay2, by2))
-    neighbor_gap = GAPS_BETWEEN_TILES + 2
-    if h_gap == 0 and v_gap == 0:
-        return True
-    if v_gap <= neighbor_gap and h_gap == 0:
-        return True
-    if h_gap <= neighbor_gap and v_gap == 0:
-        return True
-    return False
-
-
-def placement_distance(a: PlacedTile, b: PlacedTile) -> float:
-    return math.hypot(a.pack_x - b.pack_x, a.pack_y - b.pack_y)
-
-
-def pair_too_close(
-    x1: int, y1: int, w1: int, h1: int,
-    x2: int, y2: int, w2: int, h2: int,
-) -> bool:
-    if math.hypot(x1 - x2, y1 - y2) < MIN_DUPLICATE_DISTANCE:
-        return True
-    return rects_adjacent(x1, y1, w1, h1, x2, y2, w2, h2)
-
-
-def duplicate_violations(placed: list[PlacedTile]) -> list[tuple[PlacedTile, PlacedTile, float]]:
-    by_id: dict[str, list[PlacedTile]] = defaultdict(list)
-    for item in placed:
-        by_id[item.tile.source.base_id].append(item)
-    found: list[tuple[PlacedTile, PlacedTile, float]] = []
-    for items in by_id.values():
-        if len(items) < 2:
-            continue
-        for i, left in enumerate(items):
-            for right in items[i + 1 :]:
-                if pair_too_close(
-                    left.pack_x, left.pack_y, left.tile.pack_w, left.tile.pack_h,
-                    right.pack_x, right.pack_y, right.tile.pack_w, right.tile.pack_h,
-                ):
-                    found.append((left, right, placement_distance(left, right)))
-    found.sort(key=lambda row: row[2])
-    return found
-
-
-def similar_pack_size(a: PlacedTile, b: PlacedTile, ratio: float = DUPLICATE_SIZE_MATCH) -> bool:
-    aw, ah = a.tile.pack_w, a.tile.pack_h
-    bw, bh = b.tile.pack_w, b.tile.pack_h
-    return min(aw, bw) / max(aw, bw) >= ratio and min(ah, bh) / max(ah, bh) >= ratio
-
-
-def position_ok_for(item: PlacedTile, new_x: int, new_y: int, placed: list[PlacedTile]) -> bool:
-    ncx = new_x + item.tile.pack_w / 2.0
-    ncy = new_y + item.tile.pack_h / 2.0
-    for other in placed:
-        if other is item:
-            continue
-        if other.tile.source.base_id == item.tile.source.base_id:
-            if pair_too_close(
-                new_x, new_y, item.tile.pack_w, item.tile.pack_h,
-                other.pack_x, other.pack_y, other.tile.pack_w, other.tile.pack_h,
-            ):
-                return False
-        if item.tile.is_anchor and other.tile.is_anchor:
-            ocx = other.pack_x + other.tile.pack_w / 2.0
-            ocy = other.pack_y + other.tile.pack_h / 2.0
-            if math.hypot(ncx - ocx, ncy - ocy) < MINIMUM_HERO_DISTANCE:
-                return False
-    return True
-
-
-def find_swap_partner(
-    item: PlacedTile,
-    placed: list[PlacedTile],
-    rng: random.Random,
-) -> PlacedTile | None:
-    candidates = [other for other in placed if other is not item]
-    rng.shuffle(candidates)
-    for ratio in (DUPLICATE_SIZE_MATCH, 0.65):
-        for other in candidates:
-            if other.tile.source.base_id == item.tile.source.base_id:
-                continue
-            if item.tile.is_anchor and other.tile.is_anchor:
-                continue
-            if not similar_pack_size(item, other, ratio=ratio):
-                continue
-            if other.pack_x + item.tile.pack_w > CANVAS_WIDTH or other.pack_y + item.tile.pack_h > CANVAS_HEIGHT:
-                continue
-            if item.pack_x + other.tile.pack_w > CANVAS_WIDTH or item.pack_y + other.tile.pack_h > CANVAS_HEIGHT:
-                continue
-            if not position_ok_for(item, other.pack_x, other.pack_y, placed):
-                continue
-            if not position_ok_for(other, item.pack_x, item.pack_y, placed):
-                continue
-            return other
-    return None
-
-
-def separate_duplicate_placements(
-    placed: list[PlacedTile],
-    rng: random.Random,
-) -> list[str]:
-    """Swap similarly sized non-identical tiles until identical logos are far enough apart."""
-    swap_log: list[str] = []
-    for _ in range(200):
-        violations = duplicate_violations(placed)
-        if not violations:
-            break
-        left, right, _dist = violations[0]
-        mover = left
-        partner = find_swap_partner(mover, placed, rng)
-        if partner is None:
-            mover = right
-            partner = find_swap_partner(mover, placed, rng)
-        if partner is None:
-            break
-        old_mover = (mover.pack_x, mover.pack_y)
-        old_partner = (partner.pack_x, partner.pack_y)
-        mover.pack_x, partner.pack_x = partner.pack_x, mover.pack_x
-        mover.pack_y, partner.pack_y = partner.pack_y, mover.pack_y
-        message = (
-            f"Swapped '{mover.tile.source.display_name}' at {old_mover} with "
-            f"'{partner.tile.source.display_name}' at {old_partner} "
-            "to enforce distance constraint"
-        )
-        swap_log.append(message)
-    return swap_log
-
-
-def fill_leftover_holes(
-    abin,
-    placed: list[PlacedTile],
-    originals: list[LogoSource],
-    small_area: float,
-    rng: random.Random,
-) -> int:
-    if abin is None:
-        return 0
-    next_index = max(item.tile.index for item in placed) + 1
-    extra = 0
-    for _ in range(HOLE_FILL_MAX_ITERS):
-        holes = [rect for rect in getattr(abin, "_max_rects", [])]
-        if not holes:
-            break
-        hole = max(holes, key=lambda rect: float(rect.width) * float(rect.height))
-        if hole.width < HOLE_FILL_MIN_SIDE or hole.height < HOLE_FILL_MIN_SIDE:
-            break
-
-        placed_one = False
-        counts = Counter(item.tile.source.base_id for item in placed)
-        hole_x = int(hole.x + hole.width / 2)
-        hole_y = int(hole.y + hole.height / 2)
-        candidates = originals[:]
-        rng.shuffle(candidates)
-        candidates.sort(key=lambda src: counts[src.base_id])
-        micro = min(hole.width, hole.height) < MICRO_HOLE_MAX_SIDE * 2
-        for source in candidates:
-            nearby_same = False
-            min_dist = MICRO_DUP_DISTANCE if micro else MIN_DUPLICATE_DISTANCE
-            for item in placed:
-                if item.tile.source.base_id != source.base_id:
-                    continue
-                if math.hypot(item.pack_x - hole_x, item.pack_y - hole_y) < min_dist:
-                    nearby_same = True
-                    break
-            if nearby_same:
-                continue
-            tile = build_snug_tile(
-                next_index,
-                source,
-                int(hole.width),
-                int(hole.height),
-                tier="micro" if micro else "small",
-            )
-            if tile.pack_w > hole.width or tile.pack_h > hole.height:
-                continue
-            copy_id = 10_000 + extra + 1
-            tile.source = make_copy(source, copy_id)
-            rect = abin.add_rect(tile.pack_w, tile.pack_h, rid=tile.index)
-            if rect is None:
-                continue
-            placed.append(PlacedTile(tile=tile, pack_x=int(rect.x), pack_y=int(rect.y)))
-            next_index += 1
-            extra += 1
-            placed_one = True
-            break
-        if not placed_one:
-            break
-    return extra
-
-
-def rebuild_free_bin(placed: list[PlacedTile]) -> MaxRectsBssf:
-    algo = MaxRectsBssf(CANVAS_WIDTH, CANVAS_HEIGHT, rot=False)
-    for item in placed:
-        commit_rect(algo, item.pack_x, item.pack_y, item.tile.pack_w, item.tile.pack_h, item.tile.index)
-    return algo
-
-
-def fill_micro_voids(
-    placed: list[PlacedTile],
-    originals: list[LogoSource],
-    rng: random.Random,
-) -> int:
-    """Inject snug micro logos into leftover voids larger than HOLE_FILL_MIN_SIDE."""
-    algo = rebuild_free_bin(placed)
-    added = fill_leftover_holes(algo, placed, originals, SMALL_TARGET_AREA, rng)
-    return added
-
-
-def placement_collides(
-    placed: list[PlacedTile],
-    item: PlacedTile,
-    x: int,
-    y: int,
-    w: int,
-    h: int,
-) -> bool:
-    if x < 0 or y < 0 or x + w > CANVAS_WIDTH or y + h > CANVAS_HEIGHT:
-        return True
-    for other in placed:
-        if other is item:
-            continue
-        if rects_overlap(x, y, w, h, other.pack_x, other.pack_y, other.tile.pack_w, other.tile.pack_h):
+    if not previous:
+        return False
+    min_sq = min_dist * min_dist
+    for px, py in previous:
+        dx = x - px
+        dy = y - py
+        if dx * dx + dy * dy < min_sq:
             return True
     return False
 
 
-def elastic_expand(placed: list[PlacedTile], coverage: float) -> float:
-    """Grow packed tiles 3–6% into leftover dead space when coverage is under 92%."""
-    if coverage >= TARGET_PACKED_COVERAGE or not placed:
-        return 1.0
-    scale = min(ELASTIC_SCALE_MAX, max(ELASTIC_SCALE_MIN, TARGET_PACKED_COVERAGE / max(coverage, 0.01)))
-    ordered = sorted(placed, key=lambda item: item.tile.pack_w * item.tile.pack_h, reverse=True)
-    for item in ordered:
-        tile = item.tile
-        new_pack_w = max(tile.pack_w, int(round(tile.pack_w * scale)))
-        new_pack_h = max(tile.pack_h, int(round(tile.pack_h * scale)))
-        pad = tile_padding(tile)
-        max_pack_w = MAX_LOGO_WIDTH + pad * 2 + GAPS_BETWEEN_TILES
-        new_pack_w = min(new_pack_w, max_pack_w)
-        if new_pack_w == tile.pack_w and new_pack_h == tile.pack_h:
-            continue
-        new_x = item.pack_x - (new_pack_w - tile.pack_w) // 2
-        new_y = item.pack_y - (new_pack_h - tile.pack_h) // 2
-        new_x = max(0, min(CANVAS_WIDTH - new_pack_w, new_x))
-        new_y = max(0, min(CANVAS_HEIGHT - new_pack_h, new_y))
-        if placement_collides(placed, item, new_x, new_y, new_pack_w, new_pack_h):
-            new_x, new_y = item.pack_x, item.pack_y
-            if placement_collides(placed, item, new_x, new_y, new_pack_w, new_pack_h):
-                continue
-        ratio_w = (new_pack_w - GAPS_BETWEEN_TILES) / max(1, tile.card_w)
-        ratio_h = (new_pack_h - GAPS_BETWEEN_TILES) / max(1, tile.card_h)
-        pad = tile_padding(tile)
-        tile.card_w = max(1, new_pack_w - GAPS_BETWEEN_TILES)
-        tile.card_h = max(1, new_pack_h - GAPS_BETWEEN_TILES)
-        tile.scaled_w = max(1, tile.card_w - pad * 2)
-        tile.scaled_h = max(1, tile.card_h - pad * 2)
-        tile.scaled_w, tile.scaled_h = clamp_logo_dimensions(tile.scaled_w, tile.scaled_h)
-        tile.pack_w = new_pack_w
-        tile.pack_h = new_pack_h
-        item.pack_x = new_x
-        item.pack_y = new_y
-        _ = ratio_w, ratio_h
-    return scale
+def _scale_logo(src: Image.Image, max_px: int) -> Image.Image:
+    return lanczos_thumbnail(src, max_px)
 
 
-def tile_center(item: PlacedTile) -> tuple[float, float]:
-    return (
-        item.pack_x + item.tile.pack_w / 2.0,
-        item.pack_y + item.tile.pack_h / 2.0,
-    )
+def _ink_mask(img: Image.Image, grout: int) -> np.ndarray:
+    """Opaque ink (alpha ≥ 32) dilated by grout. Transparent corners stay False."""
+    alpha = img.getchannel("A")
+    if grout > 0:
+        kernel = grout * 2 + 1
+        if kernel % 2 == 0:
+            kernel += 1
+        alpha = alpha.filter(ImageFilter.MaxFilter(kernel))
+    return np.asarray(alpha) >= ALPHA_INK_MIN
 
 
-def rects_overlap(
-    x1: int, y1: int, w1: int, h1: int,
-    x2: int, y2: int, w2: int, h2: int,
-) -> bool:
-    return not (x1 + w1 <= x2 or x2 + w2 <= x1 or y1 + h1 <= y2 or y2 + h2 <= y1)
+QUAD_LABELS = ("TL", "TR", "BL", "BR")
 
 
-def area_center_of_mass(placed: list[PlacedTile]) -> tuple[float, float]:
-    total_area = 0.0
-    weighted_x = 0.0
-    weighted_y = 0.0
-    for item in placed:
-        area = float(item.tile.pack_w * item.tile.pack_h)
-        cx, cy = tile_center(item)
-        weighted_x += cx * area
-        weighted_y += cy * area
-        total_area += area
-    if total_area == 0:
-        return float(MID_X), float(MID_Y)
-    return weighted_x / total_area, weighted_y / total_area
+def quadrant_index(
+    x: float,
+    y: float,
+    canvas_w: int = CANVAS_WIDTH,
+    canvas_h: int = CANVAS_HEIGHT,
+) -> int:
+    return (0 if y < canvas_h * 0.5 else 2) + (0 if x < canvas_w * 0.5 else 1)
 
 
-def min_anchor_distance(placed: list[PlacedTile]) -> float:
-    anchors = [item for item in placed if item.tile.is_anchor]
-    if len(anchors) < 2:
-        return float(CANVAS_WIDTH)
-    best = float("inf")
-    for i, left in enumerate(anchors):
-        lcx, lcy = tile_center(left)
-        for right in anchors[i + 1 :]:
-            rcx, rcy = tile_center(right)
-            best = min(best, math.hypot(lcx - rcx, lcy - rcy))
-    return best
+def quadrant_bbox_fracs(
+    placed_items: list[dict],
+    canvas_w: int = CANVAS_WIDTH,
+    canvas_h: int = CANVAS_HEIGHT,
+) -> tuple[float, float, float, float]:
+    areas = [0.0, 0.0, 0.0, 0.0]
+    qarea = canvas_w * canvas_h / 4.0
+    if qarea <= 0:
+        return (0.0, 0.0, 0.0, 0.0)
+    for item in placed_items:
+        x, y = item["pos"]
+        w, h = item["img"].size
+        qi = quadrant_index(x + w / 2, y + h / 2, canvas_w, canvas_h)
+        areas[qi] += w * h
+    return tuple(a / qarea for a in areas)
 
 
-def heroes_are_dispersed(placed: list[PlacedTile]) -> bool:
-    return min_anchor_distance(placed) >= MINIMUM_HERO_DISTANCE * 0.92
+def quadrant_tier_counts(placed_items: list[dict]) -> list[tuple[int, int, int]]:
+    quads = [(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)]
+    for item in placed_items:
+        x, y = item["pos"]
+        iw, ih = item["img"].size
+        qi = quadrant_index(x + iw / 2, y + ih / 2)
+        h, m, s = quads[qi]
+        t = item.get("tier", "small")
+        if t == "hero":
+            quads[qi] = (h + 1, m, s)
+        elif t == "medium":
+            quads[qi] = (h, m + 1, s)
+        else:
+            quads[qi] = (h, m, s + 1)
+    return quads
 
 
-def poisson_disk_points(
-    count: int,
-    min_dist: float,
-    rng: random.Random,
-    width: int,
-    height: int,
-    k: int = 30,
-) -> list[tuple[float, float]]:
-    """Bridson Poisson-disc samples. Returns more points than `count` when possible."""
-    if count <= 0:
+def generate_mosaic_layout(
+    logos_dict: dict[str, Image.Image],
+    canvas_w: int = CANVAS_WIDTH,
+    canvas_h: int = CANVAS_HEIGHT,
+    rng: random.Random | None = None,
+    tier_buffers: dict[tuple[str, int], Image.Image] | None = None,
+) -> list[dict]:
+    rng = rng or random.Random(LAYOUT_SEED)
+    logo_keys = list(logos_dict.keys())
+    if not logo_keys:
         return []
-    cell = min_dist / math.sqrt(2)
-    grid_w = max(1, int(math.ceil(width / cell)))
-    grid_h = max(1, int(math.ceil(height / cell)))
-    grid = [-1] * (grid_w * grid_h)
-    samples: list[tuple[float, float]] = []
-    active: list[int] = []
+    rng.shuffle(logo_keys)
 
-    def cell_index(x: float, y: float) -> int:
-        gx = min(grid_w - 1, max(0, int(x / cell)))
-        gy = min(grid_h - 1, max(0, int(y / cell)))
-        return gy * grid_w + gx
+    scaled: dict[tuple[str, int], Image.Image] = dict(tier_buffers or {})
+    ink_cache: dict[tuple[int, int], np.ndarray] = {}
 
-    def far_enough(x: float, y: float) -> bool:
-        gx = min(grid_w - 1, max(0, int(x / cell)))
-        gy = min(grid_h - 1, max(0, int(y / cell)))
-        for iy in range(max(0, gy - 2), min(grid_h, gy + 3)):
-            for ix in range(max(0, gx - 2), min(grid_w, gx + 3)):
-                idx = grid[iy * grid_w + ix]
-                if idx < 0:
+    def get_scaled(lid: str, cap: int) -> Image.Image:
+        key = (lid, cap)
+        img = scaled.get(key)
+        if img is None:
+            img = _scale_logo(logos_dict[lid], cap)
+            scaled[key] = img
+        return img
+
+    def get_ink(img: Image.Image, grout: int) -> np.ndarray:
+        key = (id(img), grout)
+        mask = ink_cache.get(key)
+        if mask is None:
+            mask = _ink_mask(img, grout)
+            ink_cache[key] = mask
+        return mask
+
+    max_items = 20000
+    boxes = np.zeros((max_items, 4), dtype=np.int32)
+    inks: list[np.ndarray] = []
+    n_box = 0
+    covered = 0
+    canvas_area = float(canvas_w * canvas_h)
+    placed_items: list[dict] = []
+    placed_positions: dict[str, list[tuple[float, float]]] = {k: [] for k in logo_keys}
+    mid_x = canvas_w * 0.5
+    mid_y = canvas_h * 0.5
+
+    def occupancy_frac() -> float:
+        return covered / canvas_area if canvas_area else 0.0
+
+    def qfracs() -> tuple[float, float, float, float]:
+        return quadrant_bbox_fracs(placed_items, canvas_w, canvas_h)
+
+    def needs_fill() -> bool:
+        if occupancy_frac() < TARGET_OCCUPANCY:
+            return True
+        return min(qfracs()) < TARGET_OCCUPANCY
+
+    def overlap_indices(x: int, y: int, w: int, h: int, pad: int) -> np.ndarray:
+        if n_box == 0:
+            return np.empty(0, dtype=np.intp)
+        b = boxes[:n_box]
+        x1 = x - pad
+        y1 = y - pad
+        x2 = x + w + pad
+        y2 = y + h + pad
+        hit = (x1 < b[:, 2]) & (x2 > b[:, 0]) & (y1 < b[:, 3]) & (y2 > b[:, 1])
+        return np.flatnonzero(hit)
+
+    def alpha_collides(x: int, y: int, mask: np.ndarray, idxs: np.ndarray) -> bool:
+        mh, mw = mask.shape
+        for i in idxs:
+            ox1, oy1, ox2, oy2 = (int(v) for v in boxes[i])
+            ix1 = max(x, ox1)
+            iy1 = max(y, oy1)
+            ix2 = min(x + mw, ox2)
+            iy2 = min(y + mh, oy2)
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            a = mask[iy1 - y : iy2 - y, ix1 - x : ix2 - x]
+            b = inks[int(i)][iy1 - oy1 : iy2 - oy1, ix1 - ox1 : ix2 - ox1]
+            if a.size and b.size and (a & b).any():
+                return True
+        return False
+
+    def sample_xy(w: int, h: int, quad: int | None) -> tuple[int, int]:
+        max_x = canvas_w - w
+        max_y = canvas_h - h
+        if max_x < 0 or max_y < 0:
+            return 0, 0
+        if quad is None:
+            return rng.randint(0, max_x), rng.randint(0, max_y)
+        if quad % 2 == 0:
+            x0, x1 = 0, min(max_x, int(mid_x) - 1)
+        else:
+            x0, x1 = max(0, int(mid_x) - w + 1), max_x
+        if quad < 2:
+            y0, y1 = 0, min(max_y, int(mid_y) - 1)
+        else:
+            y0, y1 = max(0, int(mid_y) - h + 1), max_y
+        if x1 < x0:
+            x0, x1 = 0, max_x
+        if y1 < y0:
+            y0, y1 = 0, max_y
+        return rng.randint(x0, x1), rng.randint(y0, y1)
+
+    def find_spot(
+        img: Image.Image,
+        lid: str,
+        grout: int,
+        n_random: int = PLACE_TRIES,
+        quad: int | None = None,
+    ) -> tuple[int, int] | None:
+        w, h = img.size
+        if w > canvas_w or h > canvas_h:
+            return None
+        mask = get_ink(img, grout)
+        if not mask.any():
+            return None
+        prev = placed_positions[lid]
+        tries = min(max(n_random, PLACE_TRIES), PLACE_TRIES_MAX)
+        for _ in range(tries):
+            x, y = sample_xy(w, h, quad)
+            cx, cy = x + w * 0.5, y + h * 0.5
+            if quad is not None:
+                qi = (0 if cy < mid_y else 2) + (0 if cx < mid_x else 1)
+                if qi != quad:
                     continue
-                sx, sy = samples[idx]
-                if math.hypot(x - sx, y - sy) < min_dist:
-                    return False
+            if _too_close_id(cx, cy, prev):
+                continue
+            hits = overlap_indices(x, y, w, h, grout)
+            if hits.size and alpha_collides(x, y, mask, hits):
+                continue
+            return x, y
+        return None
+
+    def commit(lid: str, img: Image.Image, tier: str, grout: int, pos: tuple[int, int]) -> None:
+        nonlocal n_box, covered
+        x, y = pos
+        w, h = img.size
+        mask = get_ink(img, grout)
+        if n_box >= boxes.shape[0]:
+            return
+        boxes[n_box] = (x, y, x + w, y + h)
+        inks.append(mask)
+        n_box += 1
+        covered += w * h
+        placed_items.append({"id": lid, "img": img, "pos": (x, y), "tier": tier})
+        placed_positions[lid].append((x + w * 0.5, y + h * 0.5))
+
+    def try_place(
+        lid: str,
+        img: Image.Image,
+        tier: str,
+        grout: int,
+        quad: int | None = None,
+        tries: int = PLACE_TRIES,
+    ) -> bool:
+        pos = find_spot(img, lid, grout, n_random=tries, quad=quad)
+        if pos is None:
+            return False
+        commit(lid, img, tier, grout, pos)
         return True
 
-    x0 = rng.uniform(0, width)
-    y0 = rng.uniform(0, height)
-    samples.append((x0, y0))
-    grid[cell_index(x0, y0)] = 0
-    active.append(0)
-    target = max(count * 5, count)
+    n_hero = max(1, int(round(PRIMARY_QUEUE * HERO_FRACTION / (1.0 - MICRO_FRACTION))))
+    n_med = int(round(PRIMARY_QUEUE * MEDIUM_FRACTION / (1.0 - MICRO_FRACTION)))
+    n_small = max(0, PRIMARY_QUEUE - n_hero - n_med)
+    queue = (
+        [(rng.choice(logo_keys), "hero") for _ in range(n_hero)]
+        + [(rng.choice(logo_keys), "medium") for _ in range(n_med)]
+        + [(rng.choice(logo_keys), "small") for _ in range(n_small)]
+    )
+    rng.shuffle(queue)
 
-    while active and len(samples) < target:
-        ai = rng.randrange(len(active))
-        px, py = samples[active[ai]]
+    print(
+        f"\nPhase 2a: bbox + exact-alpha pack "
+        f"(grout {BOX_PAD}px, {PLACE_TRIES} random samples/item)..."
+    )
+    t0 = time.perf_counter()
+    placed_n = {"hero": 0, "medium": 0, "small": 0, "micro": 0}
+    for lid, tier in queue:
         placed = False
-        for _ in range(k):
-            angle = rng.uniform(0.0, math.tau)
-            radius = rng.uniform(min_dist, 2.0 * min_dist)
-            x = px + math.cos(angle) * radius
-            y = py + math.sin(angle) * radius
-            if 0 <= x < width and 0 <= y < height and far_enough(x, y):
-                grid[cell_index(x, y)] = len(samples)
-                samples.append((x, y))
-                active.append(len(samples) - 1)
+        for _try in range(8):
+            cand = lid if _try == 0 else rng.choice(logo_keys)
+            img = get_scaled(cand, TIER_MAX[tier])
+            if try_place(cand, img, tier, BOX_PAD):
+                placed_n[tier] += 1
                 placed = True
                 break
-        if not placed:
-            active.pop(ai)
-    rng.shuffle(samples)
-    return samples
-
-
-def commit_rect(algo: MaxRectsBssf, x: int, y: int, w: int, h: int, rid: int) -> PackRect:
-    rect = PackRect(x, y, w, h, rid=rid)
-    algo._split(rect)
-    algo._remove_duplicates()
-    algo.rectangles.append(rect)
-    return rect
-
-
-def choose_seeded_heroes(tiles: list[Tile], rng: random.Random) -> list[Tile]:
-    heroes = [tile for tile in tiles if tile.tier == "hero"]
-    heroes.sort(key=lambda tile: tile.pack_w * tile.pack_h, reverse=True)
-    if not heroes:
-        return []
-    n_seed = min(len(heroes), rng.randint(MIN_SEEDED_HEROES, MAX_SEEDED_HEROES))
-    return heroes[:n_seed]
-
-
-def place_seeded_heroes(
-    algo: MaxRectsBssf,
-    anchors: list[Tile],
-    rng: random.Random,
-) -> bool:
-    """Park 5-8 largest heroes with Poisson-disc center spacing; no quadrant boxes."""
-    if not anchors:
-        return True
-    candidates = poisson_disk_points(
-        len(anchors),
-        MINIMUM_HERO_DISTANCE,
-        rng,
-        CANVAS_WIDTH,
-        CANVAS_HEIGHT,
-    )
-    occupied_centers: list[tuple[float, float]] = []
-    occupied_rects: list[tuple[int, int, int, int]] = []
-    ordered = sorted(anchors, key=lambda tile: tile.pack_w * tile.pack_h, reverse=True)
-
-    for tile in ordered:
-        tile.is_anchor = True
-        best: tuple[int, int, float, float] | None = None
-        best_score = -1.0
-        search = list(candidates)
-        for _ in range(80):
-            search.append((rng.uniform(0, CANVAS_WIDTH), rng.uniform(0, CANVAS_HEIGHT)))
-        rng.shuffle(search)
-        for px, py in search:
-            x = int(round(px - tile.pack_w / 2.0))
-            y = int(round(py - tile.pack_h / 2.0))
-            x = max(0, min(CANVAS_WIDTH - tile.pack_w, x))
-            y = max(0, min(CANVAS_HEIGHT - tile.pack_h, y))
-            cx = x + tile.pack_w / 2.0
-            cy = y + tile.pack_h / 2.0
-            if any(
-                math.hypot(cx - ox, cy - oy) < MINIMUM_HERO_DISTANCE
-                for ox, oy in occupied_centers
-            ):
-                continue
-            if any(
-                rects_overlap(x, y, tile.pack_w, tile.pack_h, ox, oy, ow, oh)
-                for ox, oy, ow, oh in occupied_rects
-            ):
-                continue
-            if occupied_centers:
-                score = min(math.hypot(cx - ox, cy - oy) for ox, oy in occupied_centers)
-            else:
-                score = MINIMUM_HERO_DISTANCE
-            if score > best_score:
-                best_score = score
-                best = (x, y, cx, cy)
-        if best is None:
-            return False
-        x, y, cx, cy = best
-        commit_rect(algo, x, y, tile.pack_w, tile.pack_h, tile.index)
-        occupied_centers.append((cx, cy))
-        occupied_rects.append((x, y, tile.pack_w, tile.pack_h))
-    return True
-
-
-def try_pack(
-    tiles: list[Tile],
-    seed: int,
-    originals: list[LogoSource],
-    small_area: float,
-) -> PackResult | None:
-    rng = random.Random(seed)
-    algo = MaxRectsBssf(CANVAS_WIDTH, CANVAS_HEIGHT, rot=False)
-    by_index = {tile.index: tile for tile in tiles}
-    for tile in tiles:
-        tile.is_anchor = False
-
-    anchors = choose_seeded_heroes(tiles, rng)
-    if not place_seeded_heroes(algo, anchors, rng):
-        return None
-
-    anchor_ids = {tile.index for tile in anchors}
-    fillers = [tile for tile in tiles if tile.index not in anchor_ids]
-    rng.shuffle(fillers)  # SORT_NONE: insertion order is a pure shuffle
-    packed_ids = set(anchor_ids)
-    for tile in fillers:
-        rect = algo.add_rect(tile.pack_w, tile.pack_h, rid=tile.index)
-        if rect is None:
-            continue
-        packed_ids.add(tile.index)
-
-    if len(packed_ids) < len(anchors) + max(1, len(fillers) // 2):
-        return None
-
-    placed: list[PlacedTile] = []
-    for rect in algo.rectangles:
-        placed.append(PlacedTile(tile=by_index[rect.rid], pack_x=int(rect.x), pack_y=int(rect.y)))
-
-    hole_rng = random.Random(seed + 17)
-    extra_copies = fill_leftover_holes(algo, placed, originals, small_area, hole_rng)
-    swap_log = separate_duplicate_placements(placed, random.Random(seed + 17))
-    coverage, max_x, max_y, hole = summarize_pack(placed)
-    elastic_scale = elastic_expand(placed, coverage)
-    micro_fills = fill_micro_voids(placed, originals, random.Random(seed + 31))
-    coverage, max_x, max_y, hole = summarize_pack(placed)
-    x_com, y_com = area_center_of_mass(placed)
-    return PackResult(
-        placed=placed,
-        coverage=coverage,
-        max_x=max_x,
-        max_y=max_y,
-        largest_hole_fraction=hole,
-        seed=seed,
-        extra_copies=extra_copies + micro_fills,
-        micro_fills=micro_fills,
-        elastic_scale=elastic_scale,
-        swap_count=len(swap_log),
-        swap_log=swap_log,
-        duplicate_violations=len(duplicate_violations(placed)),
-        x_center_of_mass=x_com,
-        y_center_of_mass=y_com,
-        min_hero_distance=min_anchor_distance(placed),
-    )
-
-
-def layout_is_balanced(result: PackResult) -> bool:
-    return (
-        TARGET_COM_X_MIN < result.x_center_of_mass < TARGET_COM_X_MAX
-        and TARGET_COM_Y_MIN < result.y_center_of_mass < TARGET_COM_Y_MAX
-        and heroes_are_dispersed(result.placed)
-    )
-
-
-def fills_canvas(result: PackResult) -> bool:
-    return (
-        result.coverage >= MIN_POOL_COVERAGE
-        and result.max_x >= CANVAS_WIDTH - MAX_EMPTY_EDGE_MARGIN
-        and result.max_y >= CANVAS_HEIGHT - MAX_EMPTY_EDGE_MARGIN
-        and result.largest_hole_fraction <= MAX_HOLE_FRACTION
-        and result.duplicate_violations == 0
-        and layout_is_balanced(result)
-    )
-
-
-def expand_pool(
-    originals: list[LogoSource],
-    hero_area: float,
-    medium_area: float,
-    small_area: float,
-    rng: random.Random,
-    start_copy_id: int,
-) -> tuple[list[LogoSource], int]:
-    """Duplicate random logos until combined logo pixel area is at least 1.15x the canvas."""
-    pool = list(originals)
-    copy_id = start_copy_id
-    need = int(CANVAS_WIDTH * CANVAS_HEIGHT * POOL_AREA_MULTIPLIER)
-    print(
-        f"\nBuilding duplicate pool until logo area >= {need:,} px "
-        f"(1.15x of {CANVAS_WIDTH * CANVAS_HEIGHT:,})..."
-    )
-    while pool_logo_pixel_area(pool, hero_area, medium_area, small_area) < need and len(pool) < MAX_TILES:
-        counts = Counter(item.base_id for item in pool)
-        min_count = min(counts[item.base_id] for item in originals)
-        candidates = [item for item in originals if counts[item.base_id] == min_count]
-        copy_id += 1
-        pool.append(make_copy(rng.choice(candidates), copy_id))
-        if copy_id % 50 == 0:
-            area = pool_logo_pixel_area(pool, hero_area, medium_area, small_area)
-            print(f"  Pool {len(pool)} tiles, logo area {area:,} / {need:,}")
-    return pool, copy_id
-
-
-def find_layout(
-    originals: list[LogoSource],
-) -> tuple[PackResult, list[LogoSource], float, int, int]:
-    hero_area = float(HERO_TARGET_AREA)
-    medium_area = float(MEDIUM_TARGET_AREA)
-    small_area = float(SMALL_TARGET_AREA)
-    rng = random.Random(EXPAND_SEED)
-    pool, copy_id = expand_pool(originals, hero_area, medium_area, small_area, rng, start_copy_id=0)
-    copies = copy_id
-
-    logo_area = pool_logo_pixel_area(pool, hero_area, medium_area, small_area)
-    need = int(CANVAS_WIDTH * CANVAS_HEIGHT * POOL_AREA_MULTIPLIER)
-    print(
-        f"\nExpanded pool: {len(originals)} originals + {copies} copies = {len(pool)} tiles"
-    )
-    est = estimated_pack_coverage(pool, hero_area, medium_area, small_area)
-    print(
-        f"Logo pixel area: {logo_area:,} / target {need:,} "
-        f"({POOL_AREA_MULTIPLIER:.2f}x canvas {CANVAS_WIDTH * CANVAS_HEIGHT:,})"
-    )
-    print(f"Estimated pack coverage before layout: {est * 100:.1f}% of canvas")
-
-    best: PackResult | None = None
-
-    for expand_round in range(1, MAX_EXPAND_ROUNDS + 1):
-        for shrink_round in range(1, MAX_SHRINK_ROUNDS + 1):
-            area_scale = hero_area / HERO_TARGET_AREA
-            n_hero, n_medium, n_small = tier_counts(len(pool))
-            est = estimated_pack_coverage(pool, hero_area, medium_area, small_area)
+        if not placed and tier != "small":
+            img = get_scaled(lid, TIER_MAX["small"])
+            if try_place(lid, img, "small", BOX_PAD, tries=PLACE_TRIES_MAX):
+                placed_n["small"] += 1
+        n_pri = placed_n["hero"] + placed_n["medium"] + placed_n["small"]
+        if placed and n_pri % 250 == 0:
             print(
-                f"\nExpand round {expand_round}, scale round {shrink_round}: "
-                f"{len(pool)} tiles ({n_hero} hero / {n_medium} medium / {n_small} small), "
-                f"area scale {area_scale * 100:.1f}%, estimated coverage {est * 100:.1f}%"
+                f"    placed {n_pri}  occ {occupancy_frac() * 100:.1f}%",
+                flush=True,
             )
 
-            packed_any = False
-            for attempt in range(1, MAX_SHUFFLE_ATTEMPTS + 1):
-                seed = expand_round * 100_000 + shrink_round * 1000 + attempt
-                tiles = assign_tiers(pool, seed, hero_area, medium_area, small_area)
-                result = try_pack(tiles, seed, originals, small_area)
-                packed_count = len(result.placed) if result else 0
-                extra = ""
-                if result:
-                    packed_any = True
-                    extra = (
-                        f", coverage {result.coverage * 100:.1f}%, "
-                        f"bbox {result.max_x}x{result.max_y}, "
-                        f"hole {result.largest_hole_fraction * 100:.1f}%, "
-                        f"X_com={result.x_center_of_mass:.0f}, "
-                        f"Y_com={result.y_center_of_mass:.0f}, "
-                        f"hero_min_d={result.min_hero_distance:.0f}"
-                        f", dups_close={result.duplicate_violations}"
-                        f"{f', swaps={result.swap_count}' if result.swap_count else ''}"
-                        f"{f', +{result.extra_copies} hole fills' if result.extra_copies else ''}"
-                        f"{f', elastic={result.elastic_scale:.3f}' if result.elastic_scale > 1.0 else ''}"
-                    )
-                    if result.coverage < MIN_POOL_COVERAGE:
-                        extra += " [too sparse, retry]"
-                    elif not layout_is_balanced(result):
-                        extra += " [weight off-center, retry]"
-                    com_penalty = math.hypot(
-                        result.x_center_of_mass - MID_X,
-                        result.y_center_of_mass - MID_Y,
-                    )
-                    scatter_penalty = 0 if heroes_are_dispersed(result.placed) else 1
-                    sparse_penalty = 0 if result.coverage >= MIN_POOL_COVERAGE else 1
-                    if best is None or (
-                        result.duplicate_violations,
-                        sparse_penalty,
-                        scatter_penalty,
-                        0 if layout_is_balanced(result) else 1,
-                        result.largest_hole_fraction,
-                        com_penalty,
-                        -result.coverage,
-                        -result.max_x - result.max_y,
-                    ) < (
-                        best.duplicate_violations,
-                        0 if best.coverage >= MIN_POOL_COVERAGE else 1,
-                        0 if heroes_are_dispersed(best.placed) else 1,
-                        0 if layout_is_balanced(best) else 1,
-                        best.largest_hole_fraction,
-                        math.hypot(best.x_center_of_mass - MID_X, best.y_center_of_mass - MID_Y),
-                        -best.coverage,
-                        -best.max_x - best.max_y,
-                    ):
-                        best = result
-                print(
-                    f"  Attempt {attempt}/{MAX_SHUFFLE_ATTEMPTS} (seed={seed}) "
-                    f"... packed {packed_count}/{len(pool)}{extra}"
-                )
-                if result and fills_canvas(result):
-                    print(
-                        f"\nPacked all {len(pool)} logos edge-to-edge "
-                        f"(coverage {result.coverage * 100:.1f}%, "
-                        f"X_center_of_mass={result.x_center_of_mass:.0f}, "
-                        f"Y_center_of_mass={result.y_center_of_mass:.0f})."
-                    )
-                    if result.swap_log:
-                        print(f"Applied {result.swap_count} coordinate swaps to separate duplicate logos:")
-                        for message in result.swap_log:
-                            print(f"  {message}")
-                    else:
-                        print("No duplicate-logo coordinate swaps were needed.")
-                    return result, pool, area_scale, shrink_round, attempt
-
-            if packed_any:
-                break
-
-            print(
-                f"  Pool overflowed the {CANVAS_WIDTH}x{CANVAS_HEIGHT} canvas "
-                f"after {MAX_SHUFFLE_ATTEMPTS} shuffle attempts. Shrinking target areas by 12%..."
-            )
-            hero_area *= AREA_SHRINK_FACTOR
-            medium_area *= AREA_SHRINK_FACTOR
-            small_area *= AREA_SHRINK_FACTOR
+    fails = 0
+    while occupancy_frac() < TARGET_OCCUPANCY and fails < 200:
+        lid = rng.choice(logo_keys)
+        img = get_scaled(lid, TIER_MAX["small"])
+        if try_place(lid, img, "small", BOX_PAD, tries=PLACE_TRIES_MAX):
+            placed_n["small"] += 1
+            fails = 0
         else:
-            break
-
-        if best and fills_canvas(best):
-            return best, pool, hero_area / HERO_TARGET_AREA, shrink_round, best.seed
-
-        if packed_any and best is not None:
-            if fills_canvas(best):
-                return best, pool, hero_area / HERO_TARGET_AREA, shrink_round, best.seed
-            print(
-                f"  Using best layout from this round: coverage {best.coverage * 100:.1f}%, "
-                f"COM X={best.x_center_of_mass:.0f} Y={best.y_center_of_mass:.0f}, "
-                f"dups_close={best.duplicate_violations}."
-            )
-            return best, pool, hero_area / HERO_TARGET_AREA, shrink_round, best.seed
-
-        if len(pool) >= MAX_TILES or pool_logo_pixel_area(pool, hero_area, medium_area, small_area) >= need * 1.25:
-            print("  Coverage still has holes but the pool is at the density cap.")
-            break
-
-        added = 0
-        while added < 6 and len(pool) < MAX_TILES:
-            counts = Counter(item.base_id for item in pool)
-            min_count = min(counts[item.base_id] for item in originals)
-            candidates = [item for item in originals if counts[item.base_id] == min_count]
-            copy_id += 1
-            pool.append(make_copy(rng.choice(candidates), copy_id))
-            added += 1
-        copies = copy_id
-        print(
-            f"  Layout left empty holes. Duplicated {added} more logos "
-            f"({copies} copies total, {len(pool)} tiles)."
-        )
-
-    if best is None:
-        raise RuntimeError(
-            f"Could not pack the expanded pool onto {CANVAS_WIDTH}x{CANVAS_HEIGHT}."
-        )
+            fails += 1
+    print(
+        f"  primaries {placed_n['hero'] + placed_n['medium'] + placed_n['small']} "
+        f"({placed_n['hero']} hero / {placed_n['medium']} medium / {placed_n['small']} small) "
+        f"in {time.perf_counter() - t0:.3f}s  occupancy {occupancy_frac() * 100:.1f}%"
+    )
 
     print(
-        f"\nUsing best effort layout: coverage {best.coverage * 100:.1f}%, "
-        f"bbox {best.max_x}x{best.max_y}, hole {best.largest_hole_fraction * 100:.1f}%, "
-        f"X_center_of_mass={best.x_center_of_mass:.0f}, "
-        f"Y_center_of_mass={best.y_center_of_mass:.0f}, "
-        f"dups_close={best.duplicate_violations}."
+        f"Phase 2b: micro-fill "
+        f"({TIER_MIN['micro']}-{TIER_MAX['micro']}px, {PLACE_TRIES_MAX} samples) until occupancy "
+        f">{TARGET_OCCUPANCY * 100:.0f}%..."
     )
-    if best.swap_log:
-        print(f"Applied {best.swap_count} coordinate swaps to separate duplicate logos:")
-        for message in best.swap_log:
-            print(f"  {message}")
-    return best, pool, hero_area / HERO_TARGET_AREA, 0, best.seed
+    t1 = time.perf_counter()
+    empty_passes = 0
+    micro_before = placed_n["micro"]
+    while needs_fill() and empty_passes < 24:
+        progressed = 0
+        order = logo_keys[:]
+        rng.shuffle(order)
+        for lid in order:
+            if not needs_fill():
+                break
+            cap = rng.randint(25, 75)
+            img = get_scaled(lid, cap)
+            if try_place(lid, img, "micro", MICRO_PAD, tries=PLACE_TRIES_MAX):
+                placed_n["micro"] += 1
+                progressed += 1
+                if placed_n["micro"] % 250 == 0:
+                    print(
+                        f"    micro {placed_n['micro']}  "
+                        f"occ {occupancy_frac() * 100:.1f}%  "
+                        f"quads {[round(q * 100, 1) for q in qfracs()]}",
+                        flush=True,
+                    )
+        if progressed == 0:
+            empty_passes += 1
+        else:
+            empty_passes = 0
+    print(
+        f"  +{placed_n['micro'] - micro_before} micro-fillers in {time.perf_counter() - t1:.3f}s  "
+        f"(occupancy {occupancy_frac() * 100:.1f}%, "
+        f"quads {[round(q * 100, 1) for q in qfracs()]})"
+    )
+
+    print("Phase 2c: even micro-fill sweep (25–75px, weakest quadrant)...")
+    t2 = time.perf_counter()
+    empty_passes = 0
+    even_before = placed_n["micro"]
+    while empty_passes < 16:
+        fracs = qfracs()
+        spread = max(fracs) - min(fracs)
+        if spread <= 0.015 and min(fracs) >= min(TARGET_OCCUPANCY, occupancy_frac()):
+            break
+        qi = int(np.argmin(fracs))
+        progressed = 0
+        order = logo_keys[:]
+        rng.shuffle(order)
+        for lid in order:
+            cap = rng.randint(25, 75)
+            img = get_scaled(lid, cap)
+            if try_place(lid, img, "micro", MICRO_PAD, quad=qi, tries=PLACE_TRIES_MAX):
+                placed_n["micro"] += 1
+                progressed += 1
+                if placed_n["micro"] % 250 == 0:
+                    print(
+                        f"    even {placed_n['micro']}  "
+                        f"occ {occupancy_frac() * 100:.1f}%  "
+                        f"quads {[round(q * 100, 1) for q in qfracs()]}",
+                        flush=True,
+                    )
+        if progressed == 0:
+            empty_passes += 1
+        else:
+            empty_passes = 0
+    print(
+        f"  +{placed_n['micro'] - even_before} even-fill in {time.perf_counter() - t2:.3f}s  "
+        f"(occupancy {occupancy_frac() * 100:.1f}%, "
+        f"quads {[round(q * 100, 1) for q in qfracs()]})"
+    )
+    return placed_items
 
 
-def render_mosaic(placed: list[PlacedTile]) -> Image.Image:
+def paste_layer(canvas: Image.Image, layer: Image.Image, x: int, y: int) -> None:
+    if x >= canvas.width or y >= canvas.height:
+        return
+    src_x = 0
+    src_y = 0
+    if x < 0:
+        src_x = -x
+        x = 0
+    if y < 0:
+        src_y = -y
+        y = 0
+    width = min(layer.width - src_x, canvas.width - x)
+    height = min(layer.height - src_y, canvas.height - y)
+    if width <= 0 or height <= 0:
+        return
+    if src_x or src_y or width != layer.width or height != layer.height:
+        layer = layer.crop((src_x, src_y, src_x + width, src_y + height))
+    canvas.paste(layer, (x, y), mask=layer)
+
+
+def _composite_band(
+    job: tuple[int, int, list[tuple[int, int, bytes]], tuple[int, int, int]],
+) -> tuple[int, bytes]:
+    """Process-pool worker: alpha-composite one horizontal band of the canvas."""
+    y0, y1, placements, gray = job
+    band = Image.new("RGBA", (CANVAS_WIDTH, y1 - y0), gray + (255,))
+    for x, y, blob in placements:
+        layer = Image.open(BytesIO(blob)).convert("RGBA")
+        paste_layer(band, layer, x, y - y0)
+    buf = BytesIO()
+    band.save(buf, format="PNG", compress_level=1)
+    return y0, buf.getvalue()
+
+
+def render_mosaic(placed_items: list[dict]) -> Image.Image:
     gray = hex_to_rgb(BACKGROUND_COLOR)
+    total = len(placed_items)
+    print(
+        f"\nPhase 3: process-pool composite ({total} tiles, {RENDER_WORKERS} cores, "
+        f"{CANVAS_WIDTH}x{CANVAS_HEIGHT} @ {OUTPUT_DPI} DPI)..."
+    )
+    payloads: list[tuple[int, int, bytes, int]] = []
+    for item in placed_items:
+        buf = BytesIO()
+        item["img"].save(buf, format="PNG", compress_level=1)
+        x, y = item["pos"]
+        payloads.append((x, y, buf.getvalue(), item["img"].height))
+
+    n_bands = max(1, RENDER_WORKERS)
+    band_h = (CANVAS_HEIGHT + n_bands - 1) // n_bands
+    jobs = []
+    for i in range(n_bands):
+        y0 = i * band_h
+        y1 = min(CANVAS_HEIGHT, (i + 1) * band_h)
+        items = [
+            (x, y, blob)
+            for x, y, blob, h in payloads
+            if not (y + h <= y0 or y >= y1)
+        ]
+        jobs.append((y0, y1, items, gray))
+
     canvas = Image.new("RGBA", (CANVAS_WIDTH, CANVAS_HEIGHT), gray + (255,))
-    draw = ImageDraw.Draw(canvas)
-    card_rgb = hex_to_rgb(TILE_CARD_COLOR or BACKGROUND_COLOR)
-
-    total = len(placed)
-    print(f"\nRendering mosaic ({total} tiles onto {CANVAS_WIDTH}x{CANVAS_HEIGHT} @ {OUTPUT_DPI} DPI)...")
-    for index, item in enumerate(placed, start=1):
-        tile = item.tile
-        pad = tile_padding(tile)
-        card_x = item.pack_x
-        card_y = item.pack_y
-        logo_x = card_x + pad
-        logo_y = card_y + pad
-
-        if DRAW_TILE_CARDS:
-            box = (card_x, card_y, card_x + tile.card_w, card_y + tile.card_h)
-            if CARD_CORNER_RADIUS > 0:
-                draw.rounded_rectangle(box, radius=CARD_CORNER_RADIUS, fill=card_rgb)
-            else:
-                draw.rectangle(box, fill=card_rgb)
-
-        logo = tile.source.image.resize(
-            (tile.scaled_w, tile.scaled_h),
-            Image.Resampling.LANCZOS,
-        )
-        if logo.mode != "RGBA":
-            logo = logo.convert("RGBA")
-        halo = apply_soft_halo(logo)
-        ox = logo_x - (halo.width - tile.scaled_w) // 2
-        oy = logo_y - (halo.height - tile.scaled_h) // 2
-        canvas.paste(halo, (ox, oy), halo)
-        canvas.paste(logo, (logo_x, logo_y), mask=logo)
-        if index % 50 == 0 or index == total:
-            print(f"  Rendered {index}/{total} tiles...")
-
+    bands = _map_parallel(_composite_band, jobs)
+    for y0, blob in bands:
+        band = Image.open(BytesIO(blob)).convert("RGBA")
+        canvas.paste(band, (0, y0))
+    print(f"  Composited {total} logos across {len(jobs)} bands")
     return canvas
 
 
 def main() -> int:
+    wall0 = time.perf_counter()
     print("=" * 72)
-    print("Logo mosaic collage (Spoonflower 54x36 @ 150 DPI, mid-gray alpha paste)")
+    print("Logo mosaic collage (Spoonflower 54x36 @ 150 DPI)")
     print(f"Canvas: {CANVAS_WIDTH}x{CANVAS_HEIGHT} px  |  54x36 in @ {OUTPUT_DPI} DPI")
+    print(f"Background: {BACKGROUND_COLOR}  |  layout: bbox + exact-alpha (2px grout)")
     print(
-        f"Background: {BACKGROUND_COLOR}  |  Cards: {TILE_CARD_COLOR}  |  "
-        f"{field_kind()} field  |  grout={GAPS_BETWEEN_TILES}px  |  "
-        f"max logo width={MAX_LOGO_WIDTH}px ({MAX_LOGO_WIDTH_INCHES:.0f}\")"
+        "Tiers (LANCZOS max side): "
+        f"hero {TIER_MAX['hero']}px / medium {TIER_MAX['medium']}px / "
+        f"small {TIER_MAX['small']}px / micro {TIER_MIN['micro']}-{TIER_MAX['micro']}px"
     )
-    print("Packer: Poisson heroes + MaxRectsBssf; LANCZOS paste + Gaussian halo")
+    print(
+        f"Duplicate ≥ {MIN_DUPLICATE_DISTANCE}px  |  "
+        f"ProcessPool x{RENDER_WORKERS}  |  seed={LAYOUT_SEED}"
+    )
     print("=" * 72)
 
     paths = discover_logo_paths()
@@ -1709,43 +1120,79 @@ def main() -> int:
         print(f"No logo images found. Place PNG/JPG files in {LOGOS_DIR}")
         return 1
 
-    originals = load_logo_sources(paths)
-    result, pool, area_scale, shrink_round, attempt = find_layout(originals)
-    copies = sum(1 for src in pool if src.copy_id is not None) + result.extra_copies
-    n_hero, n_medium, n_small = tier_counts(len(pool))
+    t_norm = time.perf_counter()
+    logos_dict, tier_buffers = preprocess_assets(paths)
+    print(f"[time] Phase 1 preprocess: {time.perf_counter() - t_norm:.3f}s  ({len(logos_dict)} sources)")
+    if not logos_dict:
+        print("No usable logos after normalization.")
+        return 1
+    loaded_max = max(max(img.size) for img in logos_dict.values())
+    print(f"  Loaded source max side: {loaded_max}px (cap {ABSOLUTE_MAX_PX}px)")
+    if loaded_max > ABSOLUTE_MAX_PX:
+        print(f"ERROR: a source exceeded the {ABSOLUTE_MAX_PX}px load cap")
+        return 1
 
+    rng = random.Random(LAYOUT_SEED)
+    t_place = time.perf_counter()
+    placed_items = generate_mosaic_layout(
+        logos_dict, CANVAS_WIDTH, CANVAS_HEIGHT, rng, tier_buffers
+    )
+    print(f"[time] Phase 2 layout total: {time.perf_counter() - t_place:.3f}s  ({len(placed_items)} placed)")
+
+    long_sides = [max(item["img"].size) for item in placed_items]
+    xs = [item["pos"][0] + item["img"].width / 2 for item in placed_items]
+    ys = [item["pos"][1] + item["img"].height / 2 for item in placed_items]
+    weights = [item["img"].width * item["img"].height for item in placed_items]
+    used = sum(weights)
+    coverage = used / float(CANVAS_WIDTH * CANVAS_HEIGHT)
+    wsum = float(used) if used else 1.0
+    com_x = sum(x * w for x, w in zip(xs, weights)) / wsum
+    com_y = sum(y * w for y, w in zip(ys, weights)) / wsum
+    tiers = Counter(item.get("tier", "?") for item in placed_items)
     print("\n" + "-" * 72)
-    print(f"Original logos: {len(originals)}")
-    print(f"Duplicated copies: {copies} ({result.extra_copies} of those filled leftover holes)")
-    print(f"Placed tiles: {len(result.placed)}")
-    print(f"Tiers: {n_hero} hero / {n_medium} medium / {n_small} small")
-    print(f"Pack coverage: {result.coverage * 100:.1f}% of canvas (min {MIN_POOL_COVERAGE * 100:.0f}%)")
-    print(f"Micro-fillers injected: {result.micro_fills}  |  Elastic scale: {result.elastic_scale:.3f}")
-    print(f"X center of mass: {result.x_center_of_mass:.0f} (target {TARGET_COM_X_MIN}-{TARGET_COM_X_MAX})")
-    print(f"Y center of mass: {result.y_center_of_mass:.0f} (target {TARGET_COM_Y_MIN}-{TARGET_COM_Y_MAX})")
-    print(f"Seeded hero min distance: {result.min_hero_distance:.0f}px (min {MINIMUM_HERO_DISTANCE})")
-    print(f"Duplicate spacing: min {MIN_DUPLICATE_DISTANCE}px, remaining close pairs={result.duplicate_violations}, swaps={result.swap_count}")
-    max_logo_w = max(item.tile.scaled_w for item in result.placed)
+    print(f"Original logos: {len(logos_dict)}")
+    print(f"Placed tiles: {len(placed_items)}")
     print(
-        f"Max placed logo width: {max_logo_w}px "
-        f"({max_logo_w / OUTPUT_DPI:.2f} in, cap {MAX_LOGO_WIDTH}px / {MAX_LOGO_WIDTH_INCHES:.0f}\")"
+        f"Tiers: {tiers.get('hero', 0)} hero / {tiers.get('medium', 0)} medium / "
+        f"{tiers.get('small', 0)} small / {tiers.get('micro', 0)} micro"
+    )
+    print(f"Pixel coverage: {coverage * 100:.1f}% of canvas")
+    print(f"X center of mass: {com_x:.0f}  |  Y center of mass: {com_y:.0f}")
+    print(
+        "Quadrant mix (H/M/S): "
+        + "  ".join(
+            f"{lab} {h}/{m}/{s}"
+            for lab, (h, m, s) in zip(QUAD_LABELS, quadrant_tier_counts(placed_items))
+        )
     )
     print(
-        f"Packed bbox: {result.max_x}x{result.max_y} of {CANVAS_WIDTH}x{CANVAS_HEIGHT} "
-        f"(largest hole {result.largest_hole_fraction * 100:.1f}%)"
-    )
-    print(
-        f"Winning shuffle: seed={result.seed}, attempt={attempt}, "
-        f"shrink round={shrink_round}, area scale={area_scale * 100:.1f}%"
+        f"Logo longest side px: min {min(long_sides)} / median {int(np.median(long_sides))} / "
+        f"max {max(long_sides)} ({max(long_sides) / OUTPUT_DPI:.2f} in, "
+        f"hard cap {ABSOLUTE_MAX_PX}px / {ABSOLUTE_MAX_PX / OUTPUT_DPI:.2f}\")"
     )
     print("-" * 72)
+    if min(long_sides) < MIN_LOGO_PX:
+        print(f"ERROR: placed logo {min(long_sides)}px is below the {MIN_LOGO_PX}px floor")
+        return 1
+    if max(long_sides) > ABSOLUTE_MAX_PX:
+        print(
+            f"ERROR: placed logo {max(long_sides)}px exceeds {ABSOLUTE_MAX_PX}px cap; "
+            "refusing to render"
+        )
+        return 1
 
-    canvas = render_mosaic(result.placed)
+    t_render = time.perf_counter()
+    canvas = render_mosaic(placed_items)
+    print(f"[time] parallel composite: {time.perf_counter() - t_render:.3f}s")
+
     output_path = Path(OUTPUT_FILE)
     if not output_path.is_absolute():
         output_path = PROJECT_DIR / output_path
-    canvas.save(output_path, "PNG", dpi=(150, 150), quality=95)
+    t_save = time.perf_counter()
+    canvas.save(output_path, "PNG", dpi=(150, 150), compress_level=2)
+    print(f"[time] save PNG: {time.perf_counter() - t_save:.3f}s")
     print(f"\nSaved {output_path} ({CANVAS_WIDTH}x{CANVAS_HEIGHT} @ {OUTPUT_DPI} DPI)")
+    print(f"[time] TOTAL: {time.perf_counter() - wall0:.3f}s")
     return 0
 
 

@@ -2,8 +2,8 @@
 """
 Spoonflower logo mosaic: 54" x 36" @ 150 DPI, mid-gray RGBA alpha paste.
 
-Hard-capped with LANCZOS thumbnail (hero 220 / medium 150 / small 100 / micro 30–60).
-Vector bbox + exact alpha packing with 2px grout; process-pool composite.
+Hard-capped with LANCZOS thumbnail (hero 156 / medium 106 / small 71 / micro 21–50).
+Vector bbox + exact alpha packing with 1px grout; process-pool composite.
 
 Copyright (c) 2026 Hillwork LLC
 SPDX-License-Identifier: MIT
@@ -42,28 +42,28 @@ SMALL_FRACTION = 0.35
 MICRO_FRACTION = 0.20
 
 # Hard pixel caps: max(width, height) via Image.thumbnail(..., LANCZOS).
-ABSOLUTE_MAX_PX = 220  # Hero cap (~1.47" @ 150 DPI)
-MIN_LOGO_PX = 25       # Micro floor
+ABSOLUTE_MAX_PX = 156  # Hero cap (~1.04" @ 150 DPI)
+MIN_LOGO_PX = 21       # Micro floor
 TIER_MAX = {
-    "hero": 220,
-    "medium": 150,
-    "small": 100,
-    "micro": 75,
+    "hero": 156,
+    "medium": 106,
+    "small": 71,
+    "micro": 42,
 }
 TIER_MIN = {
-    "micro": 25,
+    "micro": 21,
 }
 
 STROKE_PX = 2
 STROKE_COLOR = (0, 0, 0)
 LIGHT_MARK_LUMA = 140  # Light/white marks get a 2px dark outer stroke
 
-MIN_DUPLICATE_DISTANCE = 500
+MIN_DUPLICATE_DISTANCE = 350
 BOX_PAD = 1              # 1px grout for dense sticker-bomb packing
 MICRO_PAD = 1
 TARGET_OCCUPANCY = 0.90
 LAYOUT_SEED = 2026
-PRIMARY_QUEUE = 4500
+PRIMARY_QUEUE = 9000
 PLACE_TRIES = 250        # random samples per item (150–300)
 PLACE_TRIES_MAX = 300
 ALPHA_INK_MIN = 32       # exact-mask collision ignores near-transparent fringe
@@ -84,22 +84,8 @@ BORDER_MATCH_MIN = 0.72
 BORDER_STD_MAX = 8.0
 
 # Filename keys match flexibly (exact name, stem, or normalized aliases like snow_bunny).
-LOGO_OVERRIDES: dict[str, dict] = {
-    "snow_bunny.png": {"invert": False},
-    "billie_eilish.png": {},
-    "lelas_bistro.png": {"invert": False},
-    "lela_s": {},
-    "takara_sushi": {"invert": True},
-    "kann": {"invert": True},
-    "function_logo": {"invert": True},
-    "karaoke_from_hell": {"invert": True},
-    "hey_luigi": {"invert": True},
-    "janken": {"invert": True},
-    "ringside": {"invert": True},
-    "ovation": {"invert": True},
-    "can_font": {"invert": True},
-    "the_star": {"invert": True},
-}
+# Optional per-logo flags. Opaque JPEG/PNG cards are stripped by luma-masking, not invert.
+LOGO_OVERRIDES: dict[str, dict] = {}
 
 
 def hex_to_rgb(color: str) -> tuple[int, int, int]:
@@ -305,17 +291,21 @@ CONTRAST_LUT = _contrast_lut()
 
 
 def boost_contrast_keep_aa(img: Image.Image) -> Image.Image:
-    """High-contrast grayscale with original anti-aliased alpha. No 1-bit interior snap."""
+    """Sharpen luma-mask alpha (and RGB if it isn't a solid mark color)."""
     rgba = img.convert("RGBA")
-    alpha = rgba.getchannel("A")
-    gray = ImageOps.grayscale(rgba.convert("RGB"))
-    gray = ImageOps.autocontrast(gray, cutoff=1)
-    gray = gray.point(CONTRAST_LUT)
-    rgb = Image.merge("RGB", (gray, gray, gray))
-    out = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
-    out.paste(rgb, mask=alpha)
-    out.putalpha(alpha)
-    return out
+    red, green, blue, alpha = rgba.split()
+    alpha = ImageOps.autocontrast(alpha, cutoff=1)
+    alpha = alpha.point(CONTRAST_LUT)
+    rgb = Image.merge("RGB", (red, green, blue))
+    gray = ImageOps.grayscale(rgb)
+    g = np.asarray(gray, dtype=np.float64)
+    am = np.asarray(alpha, dtype=np.uint8) >= 16
+    rgb_std = float(g[am].std()) if am.any() else 0.0
+    if rgb_std > 8:
+        gray = ImageOps.autocontrast(gray, cutoff=1)
+        gray = gray.point(CONTRAST_LUT)
+        rgb = Image.merge("RGB", (gray, gray, gray))
+    return Image.merge("RGBA", (*rgb.split(), alpha))
 
 
 def apply_dark_stroke(img: Image.Image, px: int = STROKE_PX) -> Image.Image:
@@ -500,6 +490,42 @@ def strip_border_box(img: Image.Image) -> Image.Image | None:
     return punch_background(img, median_rgb(pad_samples))
 
 
+def remove_white_card_border(img: Image.Image) -> Image.Image | None:
+    """Strip only outer connected near-white margin (luma ≥ 210).
+
+    4-connected flood from the image edges. Stops at dark ink, so letter
+    counters (A, B, D, O, P, R, …) are never seeded or punched.
+    """
+    work = img.convert("RGBA").copy()
+    width, height = work.size
+    pixels = work.load()
+
+    def is_outer_white(pixel) -> bool:
+        if pixel[3] < 16:
+            return True
+        return luma(pixel) >= WHITE_LUMA_MIN
+
+    mask = flood_background_mask(work, is_outer_white)
+    bg_pixels = sum(mask)
+    if bg_pixels < 8:
+        return None
+    content_pixels = width * height - bg_pixels
+    # Sparse wordmarks (thin hotel/restaurant type) are often << 4% of a white card.
+    if content_pixels < 32:
+        return None
+
+    for y in range(height):
+        row = y * width
+        for x in range(width):
+            if mask[row + x]:
+                pixels[x, y] = (0, 0, 0, 0)
+
+    cropped = crop_to_alpha(work)
+    if cropped.width < 8 or cropped.height < 8:
+        return None
+    return cropped
+
+
 def is_black_card_with_mark(img: Image.Image) -> bool:
     pixels = img.load()
     opaque = 0
@@ -518,59 +544,36 @@ def is_black_card_with_mark(img: Image.Image) -> bool:
     return black_frac >= 0.45 and (1.0 - black_frac) >= 0.08
 
 
+def luma_mask_opaque(img: Image.Image) -> tuple[Image.Image, str]:
+    """Turn an opaque card into black or white ink with luminance as alpha."""
+    gray = ImageOps.grayscale(img.convert("RGB"))
+    mean = float(np.asarray(gray, dtype=np.float64).mean())
+    if mean >= 128.0:
+        alpha = ImageOps.invert(gray)
+        color = (0, 0, 0)
+        note = f"luma-mask dark-on-light (mean {mean:.0f})"
+    else:
+        alpha = gray
+        color = (255, 255, 255)
+        note = f"luma-mask light-on-dark (mean {mean:.0f})"
+    rgb = Image.new("RGB", gray.size, color)
+    out = Image.merge("RGBA", (*rgb.split(), alpha))
+    return crop_to_alpha(out, pad=0), note
+
+
 def normalize_logo(
     img: Image.Image,
     gray_rgb: tuple[int, int, int],
     path: Path | None = None,
 ) -> tuple[Image.Image, str]:
-    override = lookup_logo_override(path) if path is not None else {}
+    _ = lookup_logo_override(path) if path is not None else {}
+    _ = gray_rgb
     rgba = img.convert("RGBA")
-    notes: list[str] = []
-    first_kind: str | None = None
     if has_useful_alpha(rgba):
         work = crop_to_alpha(rgba)
-        notes.append("alpha mask")
-    else:
-        work = rgba
-
-    for pass_index in range(3):
-        classified = classify_background(work)
-        punched = None
-        kind = ""
-        if classified:
-            kind, bg_rgb = classified
-            if has_useful_alpha(work) and kind in {"white", "tan"}:
-                mean, _std, _fill = opaque_luma_stats(work.convert("L"), work.getchannel("A"))
-                if mean >= 150:
-                    classified = None
-                    kind = ""
-            if classified and pass_index >= 1 and first_kind == "white" and kind == "black" and not is_black_card_with_mark(work):
-                break
-            if classified:
-                punched = punch_background(work, bg_rgb)
-        if punched is None:
-            punched = strip_border_box(work)
-            kind = kind or "box"
-        if punched is None:
-            if pass_index == 0 and not classified:
-                break
-            if classified:
-                notes.append(f"{kind} skipped")
-            break
-        work = crop_to_alpha(punched)
-        notes.append(f"{kind} flood-fill")
-        if first_kind is None:
-            first_kind = kind
-
-    if not any(
-        note.endswith("flood-fill") or note == "alpha mask" or note.endswith("skipped")
-        for note in notes
-    ):
-        notes.append("full-bleed")
-    work, mono_note = to_soft_grayscale(work, override)
-    notes.append(mono_note)
-    _ = gray_rgb
-    return work, " + ".join(notes)
+        work, mono_note = to_soft_grayscale(work, {})
+        return work, f"alpha mask + {mono_note}"
+    return luma_mask_opaque(rgba)
 
 
 def _preprocess_job(path_str: str) -> tuple[str, str, int, int, bytes] | None:
@@ -773,7 +776,7 @@ def generate_mosaic_layout(
             ink_cache[key] = mask
         return mask
 
-    max_items = 20000
+    max_items = 80000
     boxes = np.zeros((max_items, 4), dtype=np.int32)
     inks: list[np.ndarray] = []
     n_box = 0
@@ -954,7 +957,7 @@ def generate_mosaic_layout(
 
     print(
         f"Phase 2b: micro-fill "
-        f"({TIER_MIN['micro']}-{TIER_MAX['micro']}px, {PLACE_TRIES_MAX} samples) until occupancy "
+        f"(21–50px, {PLACE_TRIES_MAX} samples) until occupancy "
         f">{TARGET_OCCUPANCY * 100:.0f}%..."
     )
     t1 = time.perf_counter()
@@ -967,7 +970,7 @@ def generate_mosaic_layout(
         for lid in order:
             if not needs_fill():
                 break
-            cap = rng.randint(25, 75)
+            cap = rng.randint(21, 50)
             img = get_scaled(lid, cap)
             if try_place(lid, img, "micro", MICRO_PAD, tries=PLACE_TRIES_MAX):
                 placed_n["micro"] += 1
@@ -989,7 +992,7 @@ def generate_mosaic_layout(
         f"quads {[round(q * 100, 1) for q in qfracs()]})"
     )
 
-    print("Phase 2c: even micro-fill sweep (25–75px, weakest quadrant)...")
+    print("Phase 2c: even micro-fill sweep (21–50px, weakest quadrant)...")
     t2 = time.perf_counter()
     empty_passes = 0
     even_before = placed_n["micro"]
@@ -1003,7 +1006,7 @@ def generate_mosaic_layout(
         order = logo_keys[:]
         rng.shuffle(order)
         for lid in order:
-            cap = rng.randint(25, 75)
+            cap = rng.randint(21, 50)
             img = get_scaled(lid, cap)
             if try_place(lid, img, "micro", MICRO_PAD, quad=qi, tries=PLACE_TRIES_MAX):
                 placed_n["micro"] += 1

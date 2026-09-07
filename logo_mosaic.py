@@ -2,7 +2,9 @@
 """
 Spoonflower logo mosaic: 54" x 36" @ 150 DPI, mid-gray RGBA alpha paste.
 
-Luma-masked vector typography on #808080 background.
+Phase 1: luma-to-alpha (or keep existing alpha), LANCZOS-cap, contrast LUT, optional 2px stroke.
+Phase 2: random place with NumPy bbox cull then exact alpha AND; hero/med/small queue, then micro-fill.
+Phase 3: ProcessPool horizontal-band composite onto #808080.
 
 Copyright (c) 2026 Hillwork LLC
 SPDX-License-Identifier: MIT
@@ -14,7 +16,6 @@ import os
 import random
 import sys
 import time
-from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
@@ -37,19 +38,13 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".tif", ".tiff"}
 
 HERO_FRACTION = 0.10
 MEDIUM_FRACTION = 0.35
-SMALL_FRACTION = 0.35
-MICRO_FRACTION = 0.20
+MICRO_FRACTION = 0.20  # small count is PRIMARY_QUEUE minus hero/medium
 
 ABSOLUTE_MAX_PX = 156  # Hero cap (~1.04" @ 150 DPI)
-MIN_LOGO_PX = 21       # Micro floor
 TIER_MAX = {
     "hero": 156,
     "medium": 106,
     "small": 71,
-    "micro": 42,
-}
-TIER_MIN = {
-    "micro": 21,
 }
 
 STROKE_PX = 2

@@ -4,11 +4,14 @@ Print-ready fabric pattern of Portland venue and artist logos, packed as an orga
 
 The current deliverable is `spoonflower_logo_mosaic_54x36.png`: a **54″ × 36″** canvas at **150 DPI** (8100 × 5400 px) on mid-gray `#808080`. Opaque source JPEGs are converted with luminance-to-alpha (no invert overrides, no interior flood-fill). Light-on-dark cards become white ink; dark-on-light cards become black ink. White marks get a 2px dark stroke. Placement uses bounding-box culling plus exact alpha collision so curved and script marks can nest; grout is 1px.
 
+The rebuild contract — live pipeline plus rejected paths — is [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md). If this README disagrees with that file or `logo_mosaic.py`, the script and spec win.
+
 ## Layout
 
 | Path | What it is |
 |---|---|
 | `logo_mosaic.py` | Generator: Phase 1 luma-mask + LANCZOS, Phase 2 bbox+alpha pack, Phase 3 ProcessPool PNG |
+| `docs/SPECIFICATION.md` | Rebuild spec and list of failed approaches |
 | `logos/` | Original source JPEGs (52 marks) |
 | `spoonflower_logo_mosaic_54x36.png` | Current print file |
 | `test_runs/` | Earlier proofs and rejected looks |
@@ -39,11 +42,11 @@ These are obsolete generator outputs kept for reference. They are not used at ru
   - Hero: 156 px (~1.04″), hard cap `ABSOLUTE_MAX_PX`
   - Medium: 106 px
   - Small: 71 px
-  - Micro fill: 21–50 px (`randint(21, 50)`; `TIER_MAX['micro']` is 42)
-- **Packing:** shuffled hero / medium / small queue (`PRIMARY_QUEUE` 9000), then micro-fill and an evenness sweep. Each item tries 250–300 random coordinates. Stage 1 is a vectorized bbox overlap test; Stage 2 (only on overlapping boxes) is a full-resolution alpha AND (`alpha ≥ 32`, dilated by grout). Transparent corners may nest.
+  - Micro fill: 21–50 px (`randint(21, 50)`)
+- **Packing:** shuffled hero / medium / small queue (`PRIMARY_QUEUE` 9000; small is the remainder after hero/medium), then micro-fill until bbox occupancy and every quadrant are ≥ 90% or 24 empty passes. Each item tries 250–300 random coordinates. Stage 1 is a vectorized bbox overlap test; Stage 2 (only on overlapping boxes) is a full-resolution alpha AND (`alpha ≥ 32`, dilated by grout). Transparent corners may nest. There is no evenness sweep that prefers a weak quadrant.
 - **Grout:** 1 px (`BOX_PAD` / `MICRO_PAD`)
 - **Duplicates:** same logo ID at least 350 px apart (all tiers)
-- **Coverage target:** >90% bbox occupancy; evenness pass prefers the weakest quadrant
+- **Coverage target:** >90% bbox occupancy (sum of boxes / canvas; nested transparent regions overcount)
 - **Processing (opaque JPEG/PNG):** grayscale L → mean luminance. If mean ≥ 128 (dark ink on a light card): `alpha = 255 − L`, RGB = black. If mean < 128 (light ink on a dark card): `alpha = L`, RGB = white. Crop to the new alpha box. LANCZOS-cap, S-curve contrast on the alpha, 2px dark MaxFilter stroke on light marks (`opaque RGB mean ≥ 140`), then `canvas.paste(..., mask=logo)`. Sources that already have useful alpha skip luma-masking and keep their mask.
 - **Render:** ProcessPool horizontal-band composite
 - **Output:** PNG with `dpi=(150, 150)`
@@ -90,8 +93,8 @@ All of these live at the top of `logo_mosaic.py`.
 | `TIER_MAX['hero']` | 156 px | |
 | `TIER_MAX['medium']` | 106 px | |
 | `TIER_MAX['small']` | 71 px | |
-| `TIER_MIN['micro']` / `TIER_MAX['micro']` | 21 / 42 px | Micro-fill samples `randint(21, 50)` |
-| `MIN_LOGO_PX` | 21 | Refuses to save if a placed mark is smaller |
+| Micro fill | 21–50 px | `randint(21, 50)` in Phase 2b; not a `TIER_MAX` key |
+| `HERO_FRACTION` / `MEDIUM_FRACTION` / `MICRO_FRACTION` | 0.10 / 0.35 / 0.20 | Small count is `PRIMARY_QUEUE` minus hero/medium |
 
 ### Packing and spacing
 
@@ -99,7 +102,7 @@ All of these live at the top of `logo_mosaic.py`.
 |---|---|---|
 | `BOX_PAD` / `MICRO_PAD` | 1 | Grout around opaque ink |
 | `MIN_DUPLICATE_DISTANCE` | 350 | Same-ID center distance in pixels |
-| `TARGET_OCCUPANCY` | 0.90 | Micro-fill until this bbox occupancy |
+| `TARGET_OCCUPANCY` | 0.90 | Micro-fill until this bbox occupancy (and min quadrant) |
 | `PRIMARY_QUEUE` | 9000 | Hero/medium/small mix before micro-fill |
 | `PLACE_TRIES` / `PLACE_TRIES_MAX` | 250 / 300 | Random samples per item; skip if all miss |
 | `LAYOUT_SEED` | 2026 | Reproducible shuffle and sampling |
@@ -108,9 +111,7 @@ All of these live at the top of `logo_mosaic.py`.
 | `LIGHT_MARK_LUMA` | 140 | Stroke threshold on opaque mean RGB luma |
 | `ALPHA_INK_MIN` | 32 | Exact-mask collision ignores fringe |
 
-### `LOGO_OVERRIDES`
-
-The dict is empty. Card backgrounds are stripped by mean-luminance masking, not per-file `invert` flags. Keys still match filename, stem, or a normalized alias (`Zach Takara Sushi.jpg` → `takara_sushi`) if you need a future override.
+There is no `LOGO_OVERRIDES` dict. Card backgrounds are stripped by mean-luminance masking, not per-file invert flags.
 
 About 40% of medium and small **cached** buffers also get a 10–30px transparent left or right margin in Phase 1 so packed bboxes stagger without changing the packer.
 
